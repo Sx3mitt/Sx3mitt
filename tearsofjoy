@@ -1,0 +1,1563 @@
+local CONFIG = {
+	HOST = "51.21.160.177",
+	PORT = 8080,
+	TLS = false,
+	TOKEN = "PA6U2IybuRXF1VL8mjuyCUKSkqp7GqblAacGNnsQf8U",
+	ROOM = "stockholm-1",
+	SEND_RATE = 30,
+	RECONNECT = 2,
+}
+
+local ammo = 10
+local cooldown = 1
+local key = Enum.KeyCode.T
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+local GuiService = game:GetService("GuiService")
+local AssetService = game:GetService("AssetService")
+local HttpService = game:GetService("HttpService")
+
+local abs, clamp, exp, floor, min = math.abs, math.clamp, math.exp, math.floor, math.min
+local atan2, asin, rad, sin, pi = math.atan2, math.asin, math.rad, math.sin, math.pi
+
+local LP = Players.LocalPlayer
+if not LP then
+	return
+end
+
+local ENV = (getgenv and getgenv()) or _G
+if ENV.PortalBridge and ENV.PortalBridge.stop then
+	pcall(ENV.PortalBridge.stop)
+end
+
+local Bridge = {}
+ENV.PortalBridge = Bridge
+
+local alive = true
+local bin = {}
+
+local function keep(item)
+	bin[#bin + 1] = item
+	return item
+end
+
+local function hook(signal, fn)
+	return keep(signal:Connect(fn))
+end
+
+local send = function() end
+
+local function smooth(current, target, dt)
+	return current + (target - current) * (1 - exp(-dt * 16))
+end
+
+local function wrapAngle(angle)
+	return (angle + pi) % (pi * 2) - pi
+end
+
+local function smoothAngle(current, target, dt)
+	return wrapAngle(current + wrapAngle(target - current) * (1 - exp(-dt * 16)))
+end
+
+local function clampYaw(yaw, current)
+	local across, behind = rad(55), rad(130)
+	if yaw <= across or yaw >= behind then
+		return yaw
+	end
+
+	local middle = (across + behind) * 0.5
+	if not current then
+		return yaw < middle and across or behind
+	end
+
+	local margin = rad(12)
+	if abs(wrapAngle(current - behind)) < abs(wrapAngle(current - across)) then
+		return yaw > middle - margin and behind or across
+	end
+	return yaw < middle + margin and across or behind
+end
+
+local function armRoll(yaw)
+	local from = rad(30)
+	local t = clamp((abs(yaw) - from) / (pi - from), 0, 1)
+	return pi * t * t * (3 - 2 * t) * (yaw < 0 and -1 or 1)
+end
+
+local function armRotation(torsoCF, pitch, yaw)
+	local direction = torsoCF:VectorToWorldSpace(CFrame.fromEulerAnglesYXZ(pitch, yaw, 0).LookVector)
+	local up = abs(direction.Y) > 0.999 and Vector3.zAxis or Vector3.yAxis
+	return (
+		CFrame.lookAt(Vector3.zero, direction, up)
+		* CFrame.Angles(pi * 0.5, 0, 0)
+		* CFrame.Angles(0, armRoll(yaw), 0)
+	).Rotation
+end
+
+local function rigOf(character)
+	local upper = character:FindFirstChild("UpperTorso")
+	local arm = upper and character:FindFirstChild("RightUpperArm")
+	local shoulder = arm and arm:FindFirstChild("RightShoulder")
+	if shoulder and shoulder:IsA("Motor6D") then
+		return {
+			kind = "R15",
+			slide = 0.25,
+			torso = upper,
+			arm = arm,
+			shoulder = shoulder,
+			hand = character:FindFirstChild("RightHand") or arm,
+		}
+	end
+
+	local torso = character:FindFirstChild("Torso")
+	arm = torso and character:FindFirstChild("Right Arm")
+	shoulder = torso and torso:FindFirstChild("Right Shoulder")
+	if arm and shoulder and shoulder:IsA("Motor6D") then
+		return { kind = "R6", slide = 0.5, torso = torso, arm = arm, shoulder = shoulder, hand = arm }
+	end
+	return nil
+end
+
+local function gripFor(rig)
+	local rotation = CFrame.new(0, 0, 0, 0, 0, 1, -1, 0, 0, 0, -1, 0)
+	if rig.kind == "R6" then
+		return CFrame.new(-0.026, -1.295, -0.55) * rotation
+	end
+	local height = rig.hand and rig.hand.Size.Y or 0.3
+	return CFrame.new(-0.026, -(height * 0.5 + 0.18), -0.28) * rotation
+end
+
+local function armPivot(rig)
+	return rig.shoulder.C1.Position:Lerp(Vector3.new(0, rig.arm.Size.Y * 0.5, 0), rig.slide)
+end
+
+local function armAnchor(rig, torsoCF)
+	return (torsoCF * rig.rest * rig.shoulder.C1:Inverse() * CFrame.new(armPivot(rig))).Position
+end
+
+local function armPose(rig, torsoCF, pitch, yaw)
+	local rotation = armRotation(torsoCF, pitch, yaw)
+	return CFrame.new(armAnchor(rig, torsoCF) - rotation * armPivot(rig)) * rotation
+end
+
+local function aimC0(rig, torsoCF, armCF)
+	return torsoCF:Inverse() * armCF * rig.shoulder.C1 * rig.shoulder.Transform:Inverse()
+end
+
+local function decorate(part)
+	part.Anchored = false
+	part.Massless = true
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	return part
+end
+
+local function meshPart(meshId, size, textureId, pbr)
+	local ok, part = pcall(function()
+		return AssetService:CreateMeshPartAsync(meshId, {
+			CollisionFidelity = Enum.CollisionFidelity.Box,
+			RenderFidelity = Enum.RenderFidelity.Automatic,
+		})
+	end)
+
+	if ok and part then
+		part.Size = size
+		if textureId then
+			pcall(function()
+				part.TextureID = textureId
+			end)
+		end
+		if pbr then
+			pcall(function()
+				local look = Instance.new("SurfaceAppearance")
+				look.ColorMap = pbr.ColorMap
+				look.MetalnessMap = pbr.MetalnessMap
+				look.NormalMap = pbr.NormalMap
+				look.RoughnessMap = pbr.RoughnessMap
+				look.AlphaMode = Enum.AlphaMode.Overlay
+				look.Parent = part
+			end)
+		end
+		return decorate(part)
+	end
+
+	local fallback = Instance.new("Part")
+	fallback.Size = size
+	local mesh = Instance.new("SpecialMesh")
+	mesh.MeshType = Enum.MeshType.FileMesh
+	mesh.MeshId = meshId
+	mesh.Scale = size
+	if textureId then
+		mesh.TextureId = textureId
+	end
+	mesh.Parent = fallback
+	return decorate(fallback)
+end
+
+local function buildAmmoScreen(body)
+	local screen = decorate(Instance.new("Part"))
+	screen.Name = "AmmoScreen"
+	screen.Size = Vector3.new(0.379, 0.348, 0.024)
+	screen.Material = Enum.Material.ForceField
+	screen.Transparency = 0.85
+	screen.Color = Color3.fromRGB(202, 203, 209)
+	screen.CastShadow = false
+	screen.CFrame = body.CFrame * CFrame.new(-0.7591, 0.3119, -0.1452, 0, 1, 0, 0, 0, -1, -1, 0, 0)
+	screen.Parent = body
+
+	local weld = Instance.new("WeldConstraint")
+	weld.Part0, weld.Part1 = body, screen
+	weld.Parent = screen
+
+	local gui = Instance.new("SurfaceGui")
+	gui.Name = "Display"
+	gui.Face = Enum.NormalId.Front
+	gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+	gui.PixelsPerStud = 400
+	gui.LightInfluence = 0
+	gui.Brightness = 2
+	gui.AlwaysOnTop = false
+	gui.Parent = screen
+
+	local count = Instance.new("TextLabel")
+	count.Name = "Count"
+	count.Text = tostring(ammo)
+	count.Font = Enum.Font.Arcade
+	count.TextColor3 = Color3.fromRGB(255, 221, 51)
+	count.TextScaled = true
+	count.TextWrapped = true
+	count.TextStrokeColor3 = Color3.fromRGB(35, 26, 0)
+	count.TextStrokeTransparency = 0.15
+	count.BackgroundTransparency = 1
+	count.AnchorPoint = Vector2.new(0.5, 0.5)
+	count.Position = UDim2.fromScale(0.5, 0.5)
+	count.Size = UDim2.fromScale(0.92, 0.92)
+	count.Parent = gui
+
+	return count
+end
+
+local function buildGun()
+	local model = Instance.new("Model")
+	model.Name = "PortalGunModel"
+
+	local body = meshPart("rbxassetid://99500876350244", Vector3.new(2.281, 1.837, 1.340), nil, {
+		ColorMap = "rbxassetid://118927373119668",
+		MetalnessMap = "rbxassetid://120670632165079",
+		NormalMap = "rbxassetid://81430572462498",
+		RoughnessMap = "rbxassetid://71354814860629",
+	})
+	body.Name = "PortalGun_Body"
+	body.Color = Color3.fromRGB(163, 162, 165)
+	body.Material = Enum.Material.Plastic
+	body.Parent = model
+	model.PrimaryPart = body
+
+	local glass = meshPart(
+		"rbxassetid://84936547362086",
+		Vector3.new(1.083, 0.850, 1.226),
+		"rbxassetid://83468352205516"
+	)
+	glass.Name = "PortalGun_Glass"
+	glass.Material = Enum.Material.Glass
+	glass.Transparency = 0.6
+	glass.Color = Color3.fromRGB(163, 162, 165)
+	glass.CFrame = body.CFrame * CFrame.new(0.2751, 0.4166, 0)
+	glass.Parent = model
+
+	local weld = Instance.new("WeldConstraint")
+	weld.Part0, weld.Part1 = body, glass
+	weld.Parent = body
+
+	return model, buildAmmoScreen(body)
+end
+
+local holders = setmetatable({}, { __mode = "k" })
+
+local function detach(holder)
+	if not holder then
+		return
+	end
+	if holder.rig and holder.rig.shoulder.Parent then
+		holder.rig.shoulder.C0 = holder.rig.rest
+	end
+	if holder.motor then
+		holder.motor:Destroy()
+	end
+	if holder.gun then
+		holder.gun:Destroy()
+	end
+	holder.motor, holder.gun, holder.count, holder.barrel = nil, nil, nil, nil
+	holder.posed = false
+end
+
+local function attach(holder)
+	local rig = holder.rig
+	if not rig or holder.motor then
+		return
+	end
+
+	local gun, count = buildGun()
+	local grip = gripFor(rig)
+	gun.Parent = holder.character
+	gun:PivotTo(rig.hand.CFrame * grip)
+
+	local motor = Instance.new("Motor6D")
+	motor.Name = "PortalGunGrip"
+	motor.Part0 = rig.hand
+	motor.Part1 = gun.PrimaryPart
+	motor.C0 = grip
+	motor.Parent = rig.hand
+
+	holder.gun, holder.motor, holder.count = gun, motor, count
+	holder.barrel = gun.PrimaryPart
+	if holder.rounds then
+		count.Text = tostring(holder.rounds)
+	end
+end
+
+local function holderFor(character)
+	local holder = holders[character]
+	if holder then
+		if holder.rig.torso.Parent and holder.rig.shoulder.Parent then
+			return holder
+		end
+		holders[character] = nil
+		return nil
+	end
+
+	local rig = rigOf(character)
+	if not rig then
+		return nil
+	end
+	rig.rest = rig.shoulder.C0
+
+	holder = {
+		character = character,
+		rig = rig,
+		pitch = 0,
+		yaw = 0,
+		blend = 0,
+		wantPitch = 0,
+		wantYaw = 0,
+		wantBlend = 0,
+		posed = false,
+		equipped = false,
+		point = nil,
+		pointAt = 0,
+	}
+	holders[character] = holder
+	return holder
+end
+
+local function poseStep(dt)
+	for character, holder in pairs(holders) do
+		local rig = holder.rig
+		if not (character.Parent and rig.torso.Parent and rig.shoulder.Parent and rig.arm.Parent) then
+			holders[character] = nil
+			continue
+		end
+
+		if holder.wantBlend <= 0 and not holder.posed then
+			continue
+		end
+
+		holder.pitch = smooth(holder.pitch, holder.wantPitch, dt)
+		holder.yaw = smoothAngle(holder.yaw, holder.wantYaw, dt)
+		holder.blend = smooth(holder.blend, holder.wantBlend, dt)
+
+		if holder.blend <= 0.002 then
+			holder.blend = 0
+			holder.posed = false
+			rig.shoulder.C0 = rig.rest
+		else
+			holder.posed = true
+			local torsoCF = rig.torso.CFrame
+			local armCF = armPose(rig, torsoCF, holder.pitch, holder.yaw)
+			rig.shoulder.C0 = rig.rest:Lerp(aimC0(rig, torsoCF, armCF), holder.blend)
+		end
+	end
+end
+
+local folder = workspace:FindFirstChild("PortalBridgePortals")
+if not folder then
+	folder = Instance.new("Folder")
+	folder.Name = "PortalBridgePortals"
+	folder.Parent = workspace
+end
+keep(folder)
+
+local portals = {}
+local pair = { ids = {} }
+local travelling = setmetatable({}, { __mode = "k" })
+
+local function playAt(position, kind)
+	local host = Instance.new("Part")
+	host.Name = "PortalSound"
+	host.Size = Vector3.one
+	host.CFrame = CFrame.new(position)
+	host.Anchored = true
+	host.CanCollide = false
+	host.CanQuery = false
+	host.CanTouch = false
+	host.Transparency = 1
+	host.Parent = folder
+
+	local sound = Instance.new("Sound")
+	sound.SoundId = ({
+		Open = "rbxassetid://78687850811837",
+		Close = "rbxassetid://126308516153238",
+		Enter = "rbxassetid://129122193219354",
+	})[kind]
+	sound.RollOffMaxDistance = 150
+	sound.Parent = host
+	sound:Play()
+	sound.Ended:Once(function()
+		host:Destroy()
+	end)
+	Debris:AddItem(host, 8)
+end
+
+local function forgetId(id)
+	local ids = pair.ids
+	for index = 1, #ids do
+		if ids[index] == id then
+			table.remove(ids, index)
+			return
+		end
+	end
+end
+
+local function closePortal(id)
+	local record = portals[id]
+	if not record or record.closing then
+		return
+	end
+	record.closing = true
+	portals[id] = nil
+	forgetId(id)
+
+	playAt(record.plate.Position, "Close")
+	TweenService:Create(
+		record.image,
+		TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+		{ Size = UDim2.fromScale(0, 0), ImageTransparency = 1 }
+	):Play()
+	TweenService:Create(record.light, TweenInfo.new(0.3), { Brightness = 0, Range = 0 }):Play()
+	task.delay(0.3, function()
+		record.model:Destroy()
+	end)
+end
+
+local function clearPortals(announce)
+	for index = #pair.ids, 1, -1 do
+		closePortal(pair.ids[index])
+	end
+	table.clear(pair.ids)
+	if announce then
+		send("x")
+	end
+end
+
+local function buildPlate(position, normal)
+	local up = abs(normal.Y) > 0.99 and Vector3.zAxis or Vector3.yAxis
+
+	local model = Instance.new("Model")
+	model.Name = "Portal"
+
+	local plate = Instance.new("Part")
+	plate.Name = "Plate"
+	plate.Size = Vector3.new(12, 12, 0.2)
+	plate.CFrame = CFrame.lookAt(position, position + normal, up)
+	plate.Anchored = true
+	plate.CanCollide = false
+	plate.CanQuery = false
+	plate.CanTouch = false
+	plate.CastShadow = false
+	plate.Transparency = 1
+	plate.Parent = model
+	model.PrimaryPart = plate
+
+	local gui = Instance.new("SurfaceGui")
+	gui.Face = Enum.NormalId.Front
+	gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+	gui.PixelsPerStud = 64
+	gui.LightInfluence = 0
+	gui.Brightness = 2
+	gui.Parent = plate
+
+	local image = Instance.new("ImageLabel")
+	image.Name = "Image"
+	image.Image = "rbxassetid://137327392378432"
+	image.BackgroundTransparency = 1
+	image.AnchorPoint = Vector2.new(0.5, 0.5)
+	image.Position = UDim2.fromScale(0.5, 0.5)
+	image.Size = UDim2.fromScale(0, 0)
+	image.Parent = gui
+
+	local light = Instance.new("PointLight")
+	light.Color = Color3.fromRGB(255, 209, 92)
+	light.Brightness = 0
+	light.Range = 0
+	light.Shadows = false
+	light.Parent = plate
+
+	return model, plate, image, light
+end
+
+local function openPortal(owner, n, position, normal)
+	local id = owner .. ":" .. n
+	if portals[id] then
+		return nil
+	end
+
+	local model, plate, image, light = buildPlate(position, normal)
+	model.Parent = folder
+
+	TweenService:Create(
+		image,
+		TweenInfo.new(0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+		{ Size = UDim2.fromScale(1, 1) }
+	):Play()
+	TweenService:Create(light, TweenInfo.new(0.25), { Brightness = 2.4, Range = 24 }):Play()
+	playAt(position, "Open")
+
+	local record = {
+		id = id,
+		n = n,
+		owner = owner,
+		model = model,
+		plate = plate,
+		image = image,
+		light = light,
+		open = false,
+	}
+	portals[id] = record
+	table.insert(pair.ids, id)
+
+	task.delay(0.25, function()
+		if not record.closing then
+			record.open = true
+		end
+	end)
+	return record
+end
+
+local function arrive(owner, n, hit, position, normal)
+	if not hit or not openPortal(owner, n, position, normal) then
+		return
+	end
+	while #pair.ids > 2 do
+		closePortal(pair.ids[1])
+	end
+end
+
+local function partner(record)
+	for _, id in ipairs(pair.ids) do
+		local other = portals[id]
+		if other and other ~= record and other.open and not other.closing then
+			return other
+		end
+	end
+	return nil
+end
+
+local function shootFluid(origin, landing, onArrival)
+	local yellow = Color3.fromRGB(255, 209, 92)
+
+	local glob = Instance.new("Part")
+	glob.Name = "PortalFluid"
+	glob.Shape = Enum.PartType.Ball
+	glob.Size = Vector3.one * 0.7
+	glob.Material = Enum.Material.Neon
+	glob.Color = yellow
+	glob.CFrame = CFrame.new(origin)
+	glob.Anchored = true
+	glob.CanCollide = false
+	glob.CanQuery = false
+	glob.CanTouch = false
+	glob.CastShadow = false
+
+	local light = Instance.new("PointLight")
+	light.Color = yellow
+	light.Brightness = 3
+	light.Range = 10
+	light.Shadows = false
+	light.Parent = glob
+
+	local top, tail = Instance.new("Attachment"), Instance.new("Attachment")
+	top.Position = Vector3.new(0, 0.3, 0)
+	tail.Position = Vector3.new(0, -0.3, 0)
+	top.Parent, tail.Parent = glob, glob
+
+	local trail = Instance.new("Trail")
+	trail.Attachment0, trail.Attachment1 = top, tail
+	trail.Color = ColorSequence.new(yellow)
+	trail.Transparency = NumberSequence.new(0.2, 1)
+	trail.Lifetime = 0.22
+	trail.LightEmission = 1
+	trail.Parent = glob
+	glob.Parent = folder
+
+	local flight = math.max((landing - origin).Magnitude / 170, 0.05)
+	TweenService:Create(glob, TweenInfo.new(flight, Enum.EasingStyle.Linear), { CFrame = CFrame.new(landing) }):Play()
+	Debris:AddItem(glob, flight + 1)
+	task.delay(flight, function()
+		glob:Destroy()
+		if onArrival then
+			onArrival()
+		end
+	end)
+end
+
+local function slab(origin, delta, half, tmin, tmax)
+	if abs(delta) < 1e-6 then
+		if abs(origin) > half then
+			return nil, nil
+		end
+		return tmin, tmax
+	end
+
+	local t1, t2 = (-half - origin) / delta, (half - origin) / delta
+	if t1 > t2 then
+		t1, t2 = t2, t1
+	end
+	if t1 > tmin then
+		tmin = t1
+	end
+	if t2 < tmax then
+		tmax = t2
+	end
+	if tmin > tmax then
+		return nil, nil
+	end
+	return tmin, tmax
+end
+
+local function insidePortal(record, top, bottom)
+	local cf = record.plate.CFrame
+	local a, b = cf:PointToObjectSpace(top), cf:PointToObjectSpace(bottom)
+
+	local tmin, tmax = slab(a.X, b.X - a.X, 6, 0, 1)
+	if not tmin then
+		return false
+	end
+	tmin, tmax = slab(a.Y, b.Y - a.Y, 6, tmin, tmax)
+	if not tmin then
+		return false
+	end
+	return (slab(a.Z, b.Z - a.Z, 2.5, tmin, tmax)) ~= nil
+end
+
+local function doTravel(record, exit, root)
+	local out = exit.plate.CFrame.LookVector
+	local flat = Vector3.new(out.X, 0, out.Z)
+	local facing = flat.Magnitude > 0.1 and flat.Unit or root.CFrame.LookVector
+	local landing = exit.plate.Position + out * 3.5
+
+	root.CFrame = CFrame.lookAt(landing, landing + facing)
+	root.AssemblyLinearVelocity = out * math.max(root.AssemblyLinearVelocity.Magnitude, 22)
+	playAt(record.plate.Position, "Enter")
+	playAt(exit.plate.Position, "Enter")
+end
+
+local function travelStep()
+	local character = LP.Character
+	if not (character and character.Parent) then
+		return
+	end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not (humanoid and humanoid.Health > 0) then
+		return
+	end
+	local root = character:FindFirstChild("HumanoidRootPart") or character:FindFirstChild("Torso")
+	if not root then
+		return
+	end
+
+	local now = os.clock()
+	if (travelling[character] or 0) > now then
+		return
+	end
+
+	local rootHalf = root.Size.Y * 0.5
+	local top = root.Position + Vector3.yAxis * (rootHalf + 2)
+	local bottom = root.Position - Vector3.yAxis * (rootHalf + (humanoid.HipHeight or 2) + 1)
+
+	for _, id in ipairs(pair.ids) do
+		local record = portals[id]
+		if record and record.open and not record.closing and insidePortal(record, top, bottom) then
+			local exit = partner(record)
+			if exit then
+				travelling[character] = now + cooldown
+				doTravel(record, exit, root)
+				send("t" .. record.owner .. "," .. record.n .. "," .. exit.n)
+				return
+			end
+		end
+	end
+end
+
+local function visualStep(dt)
+	local clock = os.clock()
+	for _, record in pairs(portals) do
+		if not record.closing then
+			record.image.Rotation = (record.image.Rotation + 22 * dt) % 360
+			if record.open then
+				record.light.Brightness = 2.4 * (1 + 0.18 * sin(clock * 2.5))
+			end
+		end
+	end
+end
+
+local fields = table.create(16)
+
+local function q(n, scale)
+	return tostring(floor(n * scale + 0.5))
+end
+
+local function packV3(v)
+	return q(v.X, 100) .. "," .. q(v.Y, 100) .. "," .. q(v.Z, 100)
+end
+
+local function split(text, from)
+	local n = 0
+	local length = #text
+	table.clear(fields)
+
+	while from <= length do
+		local comma = string.find(text, ",", from, true)
+		n += 1
+		if comma then
+			fields[n] = tonumber(string.sub(text, from, comma - 1))
+			from = comma + 1
+		else
+			fields[n] = tonumber(string.sub(text, from))
+			break
+		end
+	end
+	return n
+end
+
+local SOCKET_FACTORIES = {
+	function()
+		return WebSocket and WebSocket.connect
+	end,
+	function()
+		return websocket and websocket.connect
+	end,
+	function()
+		return syn and syn.websocket and syn.websocket.connect
+	end,
+	function()
+		return Websocket and Websocket.connect
+	end,
+}
+
+local function socketConnect(url)
+	for _, factory in ipairs(SOCKET_FACTORIES) do
+		local ok, connect = pcall(factory)
+		if ok and type(connect) == "function" then
+			local opened, socket = pcall(connect, url)
+			if opened and socket then
+				return socket
+			end
+		end
+	end
+	return nil
+end
+
+local function socketSend(socket, text)
+	if socket.Send then
+		if pcall(socket.Send, socket, text) then
+			return true
+		end
+		return pcall(socket.Send, text)
+	end
+	if socket.send then
+		return pcall(socket.send, socket, text)
+	end
+	return false
+end
+
+local URL = (CONFIG.TLS and "wss://" or "ws://") .. CONFIG.HOST .. ":" .. CONFIG.PORT
+
+local socket = nil
+local connected = false
+local peers = {}
+local statusLabel
+local onFrame
+
+send = function(text)
+	if connected and socket then
+		socketSend(socket, text)
+	end
+end
+
+local function setStatus(text, colour)
+	if statusLabel then
+		statusLabel.Text = text
+		statusLabel.TextColor3 = colour
+	end
+end
+
+local function serverFact(name, fallback)
+	local ok, value = pcall(function()
+		return game[name]
+	end)
+	if ok and value ~= nil then
+		return value
+	end
+	return fallback
+end
+
+local function handshake()
+	return HttpService:JSONEncode({
+		t = "hello",
+		v = 1,
+		room = CONFIG.ROOM,
+		token = CONFIG.TOKEN,
+		uid = LP.UserId,
+		name = LP.Name,
+		job = game.JobId,
+		place = game.PlaceId,
+		ps = serverFact("PrivateServerId", ""),
+		owner = serverFact("PrivateServerOwnerId", 0),
+		ts = os.time(),
+		nonce = HttpService:GenerateGUID(false),
+	})
+end
+
+local function dropPeer(userId)
+	local peer = peers[userId]
+	if not peer then
+		return
+	end
+	peers[userId] = nil
+
+	for index = #pair.ids, 1, -1 do
+		local record = portals[pair.ids[index]]
+		if record and record.owner == userId then
+			closePortal(record.id)
+		end
+	end
+
+	if peer.character then
+		local holder = holders[peer.character]
+		if holder then
+			detach(holder)
+			holder.wantBlend = 0
+			holder.equipped = false
+		end
+	end
+end
+
+local function peerHolder(userId)
+	local peer = peers[userId]
+	if not peer then
+		peer = {}
+		peers[userId] = peer
+	end
+
+	local player = peer.player
+	if not (player and player.Parent) then
+		player = Players:GetPlayerByUserId(userId)
+		peer.player = player
+	end
+	if not player then
+		return nil, peer
+	end
+
+	local character = player.Character
+	if not (character and character.Parent) then
+		return nil, peer
+	end
+	peer.character = character
+	return holderFor(character), peer
+end
+
+local function peerStep()
+	for userId, peer in pairs(peers) do
+		if peer.equipped then
+			local holder = peerHolder(userId)
+			if holder then
+				holder.equipped = true
+				if not holder.motor then
+					holder.rounds = peer.rounds
+					attach(holder)
+				end
+			end
+		end
+	end
+end
+
+local rounds = ammo
+local equipped = false
+local lastShot = 0
+local shotCounter = 0
+local published = nil
+local sinceSend = 0
+local shootButton, clearButton
+
+local function onControl(text)
+	local ok, message = pcall(HttpService.JSONDecode, HttpService, text)
+	if not (ok and type(message) == "table") then
+		return
+	end
+
+	if message.t == "welcome" then
+		connected = true
+		setStatus("bridged  ." .. CONFIG.ROOM, Color3.fromRGB(120, 235, 140))
+		send("e" .. (equipped and 1 or 0))
+		send("m" .. rounds)
+	elseif message.t == "leave" and message.uid then
+		dropPeer(message.uid)
+	elseif message.t == "error" then
+		connected = false
+		setStatus("relay refused: " .. tostring(message.m), Color3.fromRGB(240, 120, 120))
+		warn("[PortalBridge] relay refused the handshake: " .. tostring(message.m))
+	end
+end
+
+local function onAim(userId)
+	local holder = peerHolder(userId)
+	if holder then
+		holder.wantPitch = fields[2] / 10000
+		holder.wantYaw = fields[3] / 10000
+		holder.wantBlend = fields[4] / 255
+		holder.pointAt = os.clock()
+	end
+end
+
+local function onEquipped(userId)
+	local holder, peer = peerHolder(userId)
+	local on = fields[2] == 1
+	peer.equipped = on
+	if not holder then
+		return
+	end
+	holder.equipped = on
+	if on then
+		attach(holder)
+	else
+		detach(holder)
+		holder.wantBlend = 0
+	end
+end
+
+local function onAmmo(userId)
+	local holder, peer = peerHolder(userId)
+	peer.rounds = fields[2]
+	if holder then
+		holder.rounds = fields[2]
+		if holder.count then
+			holder.count.Text = tostring(fields[2])
+		end
+	end
+end
+
+local function onShot(userId, count)
+	if count < 9 then
+		return
+	end
+	local n = fields[2]
+	local muzzle = Vector3.new(fields[3] / 100, fields[4] / 100, fields[5] / 100)
+	local landing = Vector3.new(fields[6] / 100, fields[7] / 100, fields[8] / 100)
+	local hit = fields[9] == 1
+	local normal = hit
+			and count >= 12
+			and Vector3.new(fields[10] / 1000, fields[11] / 1000, fields[12] / 1000)
+		or Vector3.yAxis
+
+	shootFluid(muzzle, landing, function()
+		arrive(userId, n, hit, landing + normal * 0.1, normal)
+	end)
+end
+
+local function onTravel(count)
+	if count < 4 then
+		return
+	end
+	local owner = fields[2]
+	local from = portals[owner .. ":" .. fields[3]]
+	local to = portals[owner .. ":" .. fields[4]]
+	if from then
+		playAt(from.plate.Position, "Enter")
+	end
+	if to then
+		playAt(to.plate.Position, "Enter")
+	end
+end
+
+onFrame = function(text)
+	if type(text) ~= "string" or #text < 2 then
+		return
+	end
+
+	local kind = string.byte(text, 1)
+	if kind == 123 then
+		return onControl(text)
+	end
+
+	local count = split(text, 2)
+	local userId = fields[1]
+	if not userId or userId == LP.UserId then
+		return
+	end
+
+	if kind == 97 then
+		if count >= 4 then
+			onAim(userId)
+		end
+	elseif kind == 101 then
+		onEquipped(userId)
+	elseif kind == 109 then
+		onAmmo(userId)
+	elseif kind == 115 then
+		onShot(userId, count)
+	elseif kind == 99 then
+		closePortal(userId .. ":" .. fields[2])
+	elseif kind == 120 then
+		clearPortals(false)
+	elseif kind == 116 then
+		onTravel(count)
+	end
+end
+
+local function pump(sock)
+	local ok, signal = pcall(function()
+		return sock.OnMessage or sock.onMessage or sock.OnMessageReceived
+	end)
+	if ok and signal then
+		keep(signal:Connect(function(text)
+			pcall(onFrame, text)
+		end))
+	end
+
+	local shut
+	ok, shut = pcall(function()
+		return sock.OnClose or sock.onClose
+	end)
+	if ok and shut then
+		keep(shut:Connect(function()
+			connected = false
+			socket = nil
+			setStatus("relay dropped - retrying", Color3.fromRGB(240, 190, 110))
+		end))
+	end
+end
+
+task.spawn(function()
+	while alive do
+		if not socket then
+			setStatus("dialling " .. CONFIG.HOST .. " ...", Color3.fromRGB(240, 190, 110))
+			local sock = socketConnect(URL)
+			if sock then
+				socket = sock
+				pump(sock)
+				socketSend(sock, handshake())
+			else
+				setStatus("no WebSocket in this executor", Color3.fromRGB(240, 120, 120))
+			end
+		end
+		task.wait(CONFIG.RECONNECT)
+	end
+end)
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.IgnoreWater = true
+
+local shotParams = RaycastParams.new()
+shotParams.FilterType = Enum.RaycastFilterType.Exclude
+shotParams.IgnoreWater = true
+
+local function setAmmo(value)
+	rounds = clamp(value, 0, ammo)
+
+	local holder = LP.Character and holders[LP.Character]
+	if holder then
+		holder.rounds = rounds
+		if holder.count then
+			holder.count.Text = tostring(rounds)
+		end
+	end
+
+	send("m" .. rounds)
+
+	if shootButton then
+		shootButton.BackgroundTransparency = rounds <= 0 and 0.6 or 0.15
+		shootButton.TextTransparency = rounds <= 0 and 0.55 or 0
+	end
+end
+
+local function cursorPoint(camera)
+	if UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter or not UserInputService.MouseEnabled then
+		return camera.ViewportSize * 0.5
+	end
+	return UserInputService:GetMouseLocation()
+end
+
+local function senderStep()
+	local character = LP.Character
+	if not character then
+		return
+	end
+	local holder = holderFor(character)
+	if not holder then
+		return
+	end
+
+	local camera = workspace.CurrentCamera
+	if equipped and camera then
+		local cursor = cursorPoint(camera)
+		local ray = camera:ViewportPointToRay(cursor.X, cursor.Y)
+		rayParams.FilterDescendantsInstances = { character, folder }
+		local hit = workspace:Raycast(ray.Origin, ray.Direction * 2000, rayParams)
+		holder.point = hit and hit.Position or ray.Origin + ray.Direction * 2000
+		holder.pointAt = os.clock()
+	end
+
+	local wantPitch, wantYaw, wantBlend = 0, 0, 0
+	if equipped and holder.point and os.clock() - holder.pointAt <= 0.4 then
+		local torsoCF = holder.rig.torso.CFrame
+		local offset = holder.point - armAnchor(holder.rig, torsoCF)
+		if offset.Magnitude > 0.5 then
+			local direction = torsoCF:VectorToObjectSpace(offset.Unit)
+			local limit = rad(75)
+			wantYaw = clampYaw(atan2(-direction.X, -direction.Z), holder.yaw)
+			wantPitch = clamp(asin(clamp(direction.Y, -1, 1)), -limit, limit)
+			wantBlend = 1
+		end
+	end
+	holder.wantPitch, holder.wantYaw, holder.wantBlend = wantPitch, wantYaw, wantBlend
+
+	local target = Vector3.new(wantPitch, wantYaw, wantBlend)
+	if not published or (published - target).Magnitude > 0.004 then
+		published = target
+		send("a" .. q(wantPitch, 10000) .. "," .. q(wantYaw, 10000) .. "," .. q(wantBlend, 255))
+	end
+end
+
+local function resolveShot(character, muzzle, direction)
+	shotParams.FilterDescendantsInstances = { character, folder }
+	local hit = workspace:Raycast(muzzle, direction * 300, shotParams)
+	if hit then
+		local model = hit.Instance:FindFirstAncestorOfClass("Model")
+		if model and model:FindFirstChildOfClass("Humanoid") then
+			return nil
+		end
+	end
+	return hit
+end
+
+local function fire()
+	local character = LP.Character
+	local holder = character and holders[character]
+	if not (equipped and holder) then
+		return
+	end
+
+	local now = os.clock()
+	if lastShot + 0.35 > now or rounds <= 0 then
+		return
+	end
+	if not (holder.point and now - holder.pointAt <= 0.4) then
+		return
+	end
+
+	local barrel = holder.barrel
+	if not (barrel and barrel.Parent) then
+		return
+	end
+
+	local muzzle = (barrel.CFrame * CFrame.new(barrel.Size.X * 0.5 + 0.2, 0, 0)).Position
+	local offset = holder.point - muzzle
+	if offset.Magnitude < 1 then
+		return
+	end
+
+	lastShot = now
+	setAmmo(rounds - 1)
+
+	local hit = resolveShot(character, muzzle, offset.Unit)
+	local landing = hit and hit.Position or muzzle + offset.Unit * 300
+	local normal = hit and hit.Normal or Vector3.yAxis
+
+	shotCounter += 1
+	local n = shotCounter
+
+	local frame = "s" .. n .. "," .. packV3(muzzle) .. "," .. packV3(landing) .. "," .. (hit and 1 or 0)
+	if hit then
+		frame = frame .. "," .. q(normal.X, 1000) .. "," .. q(normal.Y, 1000) .. "," .. q(normal.Z, 1000)
+	end
+	send(frame)
+
+	shootFluid(muzzle, landing, function()
+		arrive(LP.UserId, n, hit ~= nil, landing + normal * 0.1, normal)
+	end)
+end
+
+local tool = nil
+
+local function buildTool()
+	if tool then
+		tool:Destroy()
+	end
+	local backpack = LP:FindFirstChildOfClass("Backpack")
+	if not backpack then
+		return
+	end
+
+	tool = keep(Instance.new("Tool"))
+	tool.Name = "PortalGun"
+	tool.RequiresHandle = false
+	tool.CanBeDropped = false
+	tool.ToolTip = "Golden Portal Gun"
+	tool:SetAttribute("PortalGun", true)
+
+	hook(tool.Equipped, function()
+		equipped = true
+		published = nil
+		local holder = LP.Character and holderFor(LP.Character)
+		if holder then
+			holder.equipped = true
+			attach(holder)
+		end
+		send("e1")
+		setAmmo(rounds)
+	end)
+
+	hook(tool.Unequipped, function()
+		equipped = false
+		published = nil
+		local holder = LP.Character and holders[LP.Character]
+		if holder then
+			holder.equipped = false
+			holder.wantBlend = 0
+			detach(holder)
+		end
+		send("e0")
+	end)
+
+	hook(tool.Activated, fire)
+	tool.Parent = backpack
+end
+
+local TOUCH_CAPABLE = UserInputService.TouchEnabled
+local usingTouch = TOUCH_CAPABLE and not UserInputService.MouseEnabled
+local hud, cursorFrame
+local iconHidden = false
+
+local function buildStatusLabel(parent)
+	local label = Instance.new("TextLabel")
+	label.Name = "Status"
+	label.Position = UDim2.fromOffset(12, 12)
+	label.Size = UDim2.fromOffset(320, 18)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.Code
+	label.TextSize = 14
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextStrokeTransparency = 0.4
+	label.Text = ""
+	label.Parent = parent
+	return label
+end
+
+local function buildCursor(parent)
+	local image = Instance.new("ImageLabel")
+	image.Name = "Cursor"
+	image.Image = "rbxassetid://187012669"
+	image.Size = UDim2.fromOffset(10, 10)
+	image.AnchorPoint = Vector2.new(0.5, 0.5)
+	image.BackgroundTransparency = 1
+	image.ScaleType = Enum.ScaleType.Stretch
+	image.ZIndex = 5
+	image.Visible = false
+	image.Parent = parent
+	return image
+end
+
+local function buildCircle(parent, name, label, row, side, onClick)
+	local idle = Color3.fromRGB(222, 222, 222)
+
+	local button = Instance.new("TextButton")
+	button.Name = name
+	button.AnchorPoint = Vector2.new(1, 1)
+	button.Position = UDim2.new(1, -24, 1, -floor(side * 1.35 + 24 + row * (side + 14)))
+	button.Size = UDim2.fromOffset(side, side)
+	button.BackgroundColor3 = idle
+	button.BackgroundTransparency = 0.15
+	button.AutoButtonColor = false
+	button.Text = label
+	button.TextColor3 = Color3.fromRGB(25, 25, 25)
+	button.Font = Enum.Font.GothamBold
+	button.TextSize = floor(side * 0.22)
+	button.Visible = false
+	button.Parent = parent
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(1, 0)
+	corner.Parent = button
+
+	local function unpress()
+		button.BackgroundColor3 = idle
+	end
+
+	hook(button.MouseButton1Down, function()
+		button.BackgroundColor3 = Color3.fromRGB(255, 221, 51)
+	end)
+	hook(button.MouseButton1Up, unpress)
+	hook(button.MouseLeave, unpress)
+	hook(button.MouseButton1Click, onClick)
+	return button
+end
+
+local function buildHud()
+	local old = LP.PlayerGui:FindFirstChild("PortalBridgeHud")
+	if old then
+		old:Destroy()
+	end
+
+	hud = keep(Instance.new("ScreenGui"))
+	hud.Name = "PortalBridgeHud"
+	hud.ResetOnSpawn = false
+	hud.DisplayOrder = 5
+	hud.IgnoreGuiInset = false
+	pcall(function()
+		hud.ScreenInsets = Enum.ScreenInsets.DeviceSafeInsets
+	end)
+	hud.Parent = LP.PlayerGui
+
+	statusLabel = buildStatusLabel(hud)
+	cursorFrame = buildCursor(hud)
+
+	if not TOUCH_CAPABLE then
+		return
+	end
+
+	local camera = workspace.CurrentCamera
+	local viewport = camera and camera.ViewportSize or Vector2.new(1024, 768)
+	local side = clamp(min(viewport.X, viewport.Y) * 0.18, 84, 150)
+
+	shootButton = buildCircle(hud, "Shoot", "SHOOT", 0, side, fire)
+	clearButton = buildCircle(hud, "Clear", "CLEAR", 1, side, function()
+		clearPortals(true)
+	end)
+end
+
+local function hudStep()
+	if not cursorFrame then
+		return
+	end
+
+	local onTouch = equipped and usingTouch
+	cursorFrame.Visible = equipped
+	if shootButton then
+		shootButton.Visible = onTouch
+	end
+	if clearButton then
+		clearButton.Visible = onTouch
+	end
+
+	if equipped ~= iconHidden then
+		iconHidden = equipped
+		UserInputService.MouseIconEnabled = not equipped
+	end
+	if not equipped then
+		return
+	end
+
+	if usingTouch or UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter then
+		local camera = workspace.CurrentCamera
+		if camera then
+			local middle = camera.ViewportSize * 0.5 - GuiService:GetGuiInset()
+			cursorFrame.Position = UDim2.fromOffset(middle.X, middle.Y)
+		end
+	else
+		local at = UserInputService:GetMouseLocation()
+		cursorFrame.Position = UDim2.fromOffset(at.X, at.Y)
+	end
+end
+
+local function isTouch(inputType)
+	return inputType == Enum.UserInputType.Touch
+		or inputType == Enum.UserInputType.Gyro
+		or inputType == Enum.UserInputType.Accelerometer
+end
+
+local function isPointer(inputType)
+	return inputType == Enum.UserInputType.MouseMovement
+		or inputType == Enum.UserInputType.MouseButton1
+		or inputType == Enum.UserInputType.MouseButton2
+		or inputType == Enum.UserInputType.MouseWheel
+		or inputType == Enum.UserInputType.Keyboard
+end
+
+if TOUCH_CAPABLE then
+	if isTouch(UserInputService:GetLastInputType()) then
+		usingTouch = true
+	end
+	hook(UserInputService.LastInputTypeChanged, function(inputType)
+		if isTouch(inputType) then
+			usingTouch = true
+		elseif isPointer(inputType) then
+			usingTouch = false
+		end
+	end)
+end
+
+hook(UserInputService.InputBegan, function(input, processed)
+	if not processed and alive and input.KeyCode == key then
+		clearPortals(true)
+	end
+end)
+
+local function onCharacter(character)
+	equipped = false
+	published = nil
+	rounds = ammo
+
+	task.defer(function()
+		if alive then
+			buildTool()
+			setAmmo(rounds)
+			send("e0")
+		end
+	end)
+
+	character.AncestryChanged:Once(function()
+		local holder = holders[character]
+		if holder then
+			detach(holder)
+			holders[character] = nil
+		end
+	end)
+end
+
+hook(LP.CharacterAdded, onCharacter)
+if LP.Character then
+	onCharacter(LP.Character)
+end
+
+hook(Players.PlayerRemoving, function(player)
+	dropPeer(player.UserId)
+end)
+
+local sendInterval = 1 / clamp(CONFIG.SEND_RATE, 5, 60)
+local sincePeers = 0
+
+local okPre, preSignal = pcall(function()
+	return RunService.PreSimulation
+end)
+local stepSignal = okPre and preSignal or nil
+local stepIsPre = stepSignal ~= nil
+stepSignal = stepSignal or RunService.Stepped
+
+hook(stepSignal, function(a, b)
+	if not alive then
+		return
+	end
+
+	local dt = (stepIsPre and a or b) or 1 / 60
+	sinceSend += dt
+	if sinceSend >= sendInterval then
+		sinceSend = 0
+		senderStep()
+	end
+	poseStep(dt)
+end)
+
+hook(RunService.Heartbeat, function(dt)
+	if not alive then
+		return
+	end
+
+	travelStep()
+	sincePeers += dt
+	if sincePeers >= 0.1 then
+		sincePeers = 0
+		peerStep()
+	end
+end)
+
+hook(RunService.RenderStepped, function(dt)
+	if not alive then
+		return
+	end
+	visualStep(dt)
+	hudStep()
+end)
+
+local function closeSocket()
+	if not socket then
+		return
+	end
+	pcall(function()
+		if socket.Close then
+			socket:Close()
+		elseif socket.close then
+			socket:close()
+		end
+	end)
+	socket = nil
+end
+
+local function emptyBin()
+	for index = #bin, 1, -1 do
+		local item = bin[index]
+		bin[index] = nil
+		pcall(function()
+			if typeof(item) == "RBXScriptConnection" then
+				item:Disconnect()
+			else
+				item:Destroy()
+			end
+		end)
+	end
+end
+
+function Bridge.stop()
+	if not alive then
+		return
+	end
+	alive = false
+
+	for character, holder in pairs(holders) do
+		pcall(detach, holder)
+		holders[character] = nil
+	end
+	for id, record in pairs(portals) do
+		portals[id] = nil
+		pcall(function()
+			record.model:Destroy()
+		end)
+	end
+	table.clear(pair.ids)
+	table.clear(peers)
+
+	closeSocket()
+	connected = false
+	emptyBin()
+
+	UserInputService.MouseIconEnabled = true
+	statusLabel, shootButton, clearButton, cursorFrame, hud, tool = nil, nil, nil, nil, nil, nil
+end
+
+function Bridge.clear()
+	clearPortals(true)
+end
+
+buildHud()
+setStatus("dialling " .. CONFIG.HOST .. " ...", Color3.fromRGB(240, 190, 110))
+
+print(("REAADY NAXYI %s (%d), EZ %q. %s EZ EZ."):format(
+	LP.Name,
+	LP.UserId,
+	CONFIG.ROOM,
+	key.Name
+))
