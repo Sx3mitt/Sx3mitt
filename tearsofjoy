@@ -125,6 +125,18 @@ end
 -- assigns it comes further down.
 local send = function() end
 
+-- Wire encoding, up here because the portal code needs it too. Angles go out as
+-- radians x 10000, positions as studs x 100, normals x 1000.
+local floor = math.floor
+
+local function q(n, scale)
+	return tostring(floor(n * scale + 0.5))
+end
+
+local function packV3(v)
+	return q(v.X, 100) .. "," .. q(v.Y, 100) .. "," .. q(v.Z, 100)
+end
+
 --=========================================================================
 -- assets and tunables, straight out of the Studio build
 --=========================================================================
@@ -190,6 +202,30 @@ local GRIP_R6 = CFrame.new(-0.026, -1.295, -0.55) * GRIP_ROT
 -- towards the middle of the arm's top face. R15's shoulder already sits near
 -- the top of the upper arm, so it needs much less.
 local SLIDE = { R6 = 0.5, R15 = 0.25 }
+
+-- The rest pose, cached per joint rather than per holder.
+--
+-- This used to be `rig.rest = rig.shoulder.C0` read at holder-build time, and it
+-- was a slow poison: a holder is dropped whenever the torso or shoulder loses its
+-- parent for a frame, and the next one re-read C0 - by then a POSED C0, because
+-- this script had already written it. So "rest" drifted into whatever the arm
+-- happened to be doing, and once blend fell to zero the joint was handed back to
+-- the Animator holding a bogus rest. The arm froze mid-aim and the gun looked
+-- like a bare hold. Two hours of respawns is plenty to get there.
+--
+-- Keyed by the Motor6D and weak, so the true rest is read exactly once per joint,
+-- before anything here writes it, and a fresh character (a fresh joint) reads its
+-- own.
+local rests = setmetatable({}, { __mode = "k" })
+
+local function restOf(shoulder)
+	local rest = rests[shoulder]
+	if not rest then
+		rest = shoulder.C0
+		rests[shoulder] = rest
+	end
+	return rest
+end
 
 -- torso, the limb the shoulder swings, the shoulder joint, and the limb the gun
 -- is jointed to. nil for anything that is neither rig, or is not built yet.
@@ -499,6 +535,22 @@ local function attach(holder)
 	end
 end
 
+-- Dropping a holder has to hand the joint back cleanly, or the arm is left
+-- wherever the last frame put it. Every path that forgets a holder goes through
+-- here.
+local function forget(character, holder)
+	holder = holder or holders[character]
+	holders[character] = nil
+	if not holder then
+		return
+	end
+	local shoulder = holder.rig and holder.rig.shoulder
+	if shoulder and shoulder.Parent then
+		shoulder.C0 = holder.rig.rest
+	end
+	detach(holder)
+end
+
 -- Built the first time a character actually needs one rather than off
 -- CharacterAdded: a rig assembled by hand (EnforceR6 and the like) can be a
 -- frame or two behind the character appearing, and a rig that was not ready then
@@ -509,7 +561,7 @@ local function holderFor(character)
 		if holder.rig.torso.Parent and holder.rig.shoulder.Parent then
 			return holder
 		end
-		holders[character] = nil -- the rig went away under us
+		forget(character, holder) -- the rig went away under us
 		return nil
 	end
 
@@ -517,7 +569,7 @@ local function holderFor(character)
 	if not rig then
 		return nil -- neither rig, or not built yet; the next frame tries again
 	end
-	rig.rest = rig.shoulder.C0 -- read before anything below writes it
+	rig.rest = restOf(rig.shoulder) -- the joint's own first-ever C0, never a pose
 
 	holder = {
 		character = character,
@@ -548,12 +600,12 @@ end
 local function poseStep(dt)
 	for character, holder in pairs(holders) do
 		if not character.Parent then
-			holders[character] = nil
+			forget(character, holder)
 			continue
 		end
 		local rig = holder.rig
 		if not (rig.torso.Parent and rig.shoulder.Parent and rig.arm.Parent) then
-			holders[character] = nil
+			forget(character, holder)
 			continue
 		end
 
@@ -725,6 +777,10 @@ local function openPortal(owner, n, position, normal)
 		light = light,
 		open = false,
 		bornAt = os.clock(),
+		-- kept so this portal can be re-announced to a peer that reconnects or
+		-- joins late; without it a churned connection loses the pair for good
+		position = position,
+		normal = normal,
 	}
 	portals[id] = record
 	task.delay(OPEN_TIME, function()
@@ -819,6 +875,29 @@ local function clearPortals(announce)
 	table.clear(pair.ids)
 	if announce then
 		send("x")
+	end
+end
+
+-- Re-declare every portal this machine owns. Sent on `welcome` and whenever a
+-- peer joins, so a reconnect - which used to wipe the pair permanently - now
+-- heals itself within a frame or two.
+local function announcePortals()
+	for _, id in ipairs(pair.ids) do
+		local record = portals[id]
+		if record and record.owner == LP.UserId and not record.closing then
+			send(
+				"p"
+					.. record.n
+					.. ","
+					.. packV3(record.position)
+					.. ","
+					.. q(record.normal.X, 1000)
+					.. ","
+					.. q(record.normal.Y, 1000)
+					.. ","
+					.. q(record.normal.Z, 1000)
+			)
+		end
 	end
 end
 
@@ -977,15 +1056,6 @@ end
 -- Angles are radians x 10000, positions studs x 100.
 
 local HttpService = game:GetService("HttpService")
-local floor = math.floor
-
-local function q(n, scale)
-	return tostring(floor(n * scale + 0.5))
-end
-
-local function packV3(v)
-	return q(v.X, 100) .. "," .. q(v.Y, 100) .. "," .. q(v.Z, 100)
-end
 
 -- one reusable buffer: the aim path runs 30 times a second and should not be
 -- handing the collector a new table each time
@@ -1061,13 +1131,47 @@ end
 local URL = (CONFIG.TLS and "wss://" or "ws://") .. CONFIG.HOST .. ":" .. CONFIG.PORT
 
 local socket = nil
+local socketGen = 0 -- bumped per dial, so a dead socket's callbacks are ignored
+local socketBin = {} -- this socket's connections, dropped when it is replaced
 local connected = false
+local lastHeard = 0 -- os.clock() of the last frame from the relay
+local backoff = CONFIG.RECONNECT
 local peers = {} -- userId -> peer state
 local onFrame -- assigned below, once the handlers exist
+local resync = function() end -- assigned once the local player's state exists
 
 send = function(text)
 	if connected and socket then
 		socketSend(socket, text)
+	end
+end
+
+local HEARTBEAT = 10 -- seconds between `h` frames
+local DEAD_AFTER = 26 -- no word from the relay for this long and the socket is dead
+
+-- Every reconnect used to leave its OnMessage connection alive in `bin`, so after
+-- an hour of churn a frame could be handled twice over by sockets that were
+-- already dead. Each dial now gets a generation and its own bin, and this is the
+-- one way a socket goes away.
+local function dropSocket()
+	for index = #socketBin, 1, -1 do
+		local item = socketBin[index]
+		socketBin[index] = nil
+		pcall(function()
+			item:Disconnect()
+		end)
+	end
+	local old = socket
+	socket = nil
+	connected = false
+	if old then
+		pcall(function()
+			if old.Close then
+				old:Close()
+			elseif old.close then
+				old:close()
+			end
+		end)
 	end
 end
 
@@ -1102,26 +1206,39 @@ local function handshake()
 	})
 end
 
-local function dropPeer(userId)
+-- A peer whose socket blinked is not a peer who left. Its gun comes off, because
+-- a frozen arm holding a gun is worse than no gun, but its half of the pair is
+-- kept for GRACE seconds - the reconnect will re-announce it.
+local function losePeer(userId)
 	local peer = peers[userId]
 	if not peer then
 		return
 	end
-	peers[userId] = nil
-	-- their end of the pair goes with them: nothing here can re-sync a portal
-	-- whose owner has left
-	for index = #pair.ids, 1, -1 do
-		local record = portals[pair.ids[index]]
-		if record and record.owner == userId then
-			closePortal(record.id)
-		end
-	end
+	peer.lostAt = os.clock()
+	peer.equipped = false
 	if peer.character then
 		local holder = holders[peer.character]
 		if holder then
 			detach(holder)
 			holder.wantBlend = 0
 			holder.equipped = false
+		end
+	end
+end
+
+local function dropPeer(userId)
+	local peer = peers[userId]
+	if not peer then
+		return
+	end
+	losePeer(userId)
+	peers[userId] = nil
+	-- now their end of the pair really does go: nothing here can re-sync a portal
+	-- whose owner is gone
+	for index = #pair.ids, 1, -1 do
+		local record = portals[pair.ids[index]]
+		if record and record.owner == userId then
+			closePortal(record.id)
 		end
 	end
 end
@@ -1157,33 +1274,62 @@ local function onControl(text)
 	end
 	if message.t == "welcome" then
 		connected = true
+		backoff = CONFIG.RECONNECT
 		setStatus("bridged  ." .. CONFIG.ROOM, Color3.fromRGB(120, 235, 140))
 		log("welcome, peers:", message.peers and #message.peers or 0)
-		-- tell whoever is already in the room where we stand
-		send("e" .. (holders[LP.Character] and holders[LP.Character].equipped and 1 or 0))
+		resync() -- tell the room where we stand, portals included
+	elseif message.t == "join" then
+		-- somebody arrived or came back: hand them our whole state, since they
+		-- cannot know about portals that were opened before they got here
+		if message.uid then
+			local peer = peers[message.uid]
+			if peer then
+				peer.lostAt = nil
+			end
+		end
+		resync()
 	elseif message.t == "leave" and message.uid then
-		dropPeer(message.uid)
+		losePeer(message.uid)
 	elseif message.t == "error" then
 		connected = false
-		setStatus("relay refused: " .. tostring(message.m), Color3.fromRGB(240, 120, 120))
-		warn("[PortalBridge] relay refused the handshake: " .. tostring(message.m))
+		local why = tostring(message.m)
+		if message.holders then
+			why = why .. " (held by " .. table.concat(message.holders, ", ") .. ")"
+		end
+		setStatus("relay refused: " .. why, Color3.fromRGB(240, 120, 120))
+		warn("[PortalBridge] relay refused the handshake: " .. why)
+		backoff = math.min(backoff * 2, 30) -- stop hammering a room we cannot enter
+		dropSocket()
 	end
 end
 
 onFrame = function(text)
-	if type(text) ~= "string" or #text < 2 then
+	if type(text) ~= "string" or #text < 1 then
 		return
 	end
+	-- anything at all arriving proves the socket is alive, which is what the
+	-- watchdog below reads. This is the whole reason `h` exists.
+	lastHeard = os.clock()
 	local kind = string.byte(text, 1)
 
+	if kind == 104 then -- 'h' our own heartbeat, bounced straight back
+		return
+	end
 	if kind == 123 then -- '{' : the control channel is the only JSON on the wire
 		return onControl(text)
+	end
+	if #text < 2 then
+		return
 	end
 
 	local n = split(text, 2)
 	local userId = fields[1]
 	if not userId or userId == LP.UserId then
 		return -- the relay does not echo, but never trust that
+	end
+	local known = peers[userId]
+	if known then
+		known.lostAt = nil -- plainly still here
 	end
 
 	if kind == 97 then -- 'a' aim
@@ -1233,6 +1379,17 @@ onFrame = function(text)
 		shootFluid(muzzle, landing, function()
 			arrive(userId, portalN, hit, landing + normal * SURFACE_OFFSET, normal)
 		end)
+	elseif kind == 112 then -- 'p' a portal the peer already has open, re-announced
+		if n < 8 then       -- after a reconnect or a late join. No glob: it is
+			return           -- already there, this is only catching us up.
+		end
+		arrive(
+			userId,
+			fields[2],
+			true,
+			Vector3.new(fields[3] / 100, fields[4] / 100, fields[5] / 100),
+			Vector3.new(fields[6] / 1000, fields[7] / 1000, fields[8] / 1000)
+		)
 	elseif kind == 99 then -- 'c' close one
 		closePortal(userId .. ":" .. fields[2])
 	elseif kind == 120 then -- 'x' clear every portal, both ends of the bridge
@@ -1253,46 +1410,82 @@ onFrame = function(text)
 	end
 end
 
-local function pump(sock)
-	local ok, signal = pcall(function()
+local function pump(sock, generation)
+	local function bind(getter, handler)
+		local ok, signal = pcall(getter)
+		if not (ok and signal) then
+			return
+		end
+		local bound, connection = pcall(function()
+			return signal:Connect(handler)
+		end)
+		if bound and connection then
+			socketBin[#socketBin + 1] = connection
+		end
+	end
+
+	bind(function()
 		return sock.OnMessage or sock.onMessage or sock.OnMessageReceived
+	end, function(text)
+		if generation ~= socketGen then
+			return -- a socket we have already given up on, still talking
+		end
+		local fine, err = pcall(onFrame, text)
+		if not fine then
+			-- never silent: this was behind CONFIG.DEBUG and it hid a real fault
+			warn("[PortalBridge] frame error: " .. tostring(err))
+		end
 	end)
-	if ok and signal then
-		keep(signal:Connect(function(text)
-			local fine, err = pcall(onFrame, text)
-			if not fine then
-				log("frame error:", err)
-			end
-		end))
-	end
-	local shut
-	ok, shut = pcall(function()
+
+	bind(function()
 		return sock.OnClose or sock.onClose
+	end, function()
+		if generation ~= socketGen then
+			return
+		end
+		dropSocket()
+		setStatus("relay dropped - redialling", Color3.fromRGB(240, 190, 110))
 	end)
-	if ok and shut then
-		keep(shut:Connect(function()
-			connected = false
-			socket = nil
-			setStatus("relay dropped - retrying", Color3.fromRGB(240, 190, 110))
-		end))
-	end
 end
 
 task.spawn(function()
+	local sinceBeat = 0
 	while alive do
 		if not socket then
+			socketGen += 1
+			local generation = socketGen
 			setStatus("dialling " .. CONFIG.HOST .. " ...", Color3.fromRGB(240, 190, 110))
 			local sock = socketConnect(URL)
 			if sock then
 				socket = sock
-				pump(sock)
-				socketSend(sock, handshake()) -- the relay answers with `welcome`
-				                              -- or `error`, which sets `connected`
+				lastHeard = os.clock() -- give the handshake a fair window
+				pump(sock, generation)
+				socketSend(sock, handshake()) -- the relay answers `welcome` or `error`
 			else
 				setStatus("no WebSocket in this executor", Color3.fromRGB(240, 120, 120))
 			end
+			task.wait(backoff)
+		else
+			task.wait(1)
+			sinceBeat += 1
+			if sinceBeat >= HEARTBEAT then
+				sinceBeat = 0
+				if connected then
+					socketSend(socket, "h")
+				end
+			end
+			-- Executor WebSockets do not reliably raise OnClose, and a home router
+			-- or a mobile carrier drops an idle NAT mapping without telling either
+			-- end. A still cursor sends nothing (PUBLISH_EPSILON), so a parked
+			-- player used to go quiet, get hung up on at the relay's idle timeout,
+			-- and sit on a socket that was already dead - which is what left a gun
+			-- attached to a frozen arm and portals that never paired again.
+			if os.clock() - lastHeard > DEAD_AFTER then
+				warn("[PortalBridge] relay went quiet - redialling")
+				dropSocket()
+				setStatus("relay quiet - redialling", Color3.fromRGB(240, 190, 110))
+			end
 		end
-		task.wait(CONFIG.RECONNECT)
 	end
 end)
 
@@ -1332,6 +1525,15 @@ local function setAmmo(value)
 		shootButton.BackgroundTransparency = ammo <= 0 and 0.6 or 0.15
 		shootButton.TextTransparency = ammo <= 0 and 0.55 or 0
 	end
+end
+
+-- Everything a peer needs to draw us: whether the gun is out, how much fluid is
+-- left, and every portal we own. Sent on `welcome` and on any `join`, which is
+-- what makes a reconnect or a late join heal instead of silently losing the pair.
+resync = function()
+	send("e" .. (equipped and 1 or 0))
+	send("m" .. ammo)
+	announcePortals()
 end
 
 -- Studio streamed the cursor point to the server and let it work out the angles.
@@ -1737,10 +1939,16 @@ end)
 
 -- A peer's `e1` can land before its character exists on this machine, and its
 -- character is rebuilt on every respawn, so the gun is re-checked rather than
--- attached once and hoped for.
+-- attached once and hoped for. This is also where a peer that went quiet for
+-- longer than the grace period finally gives up its half of the pair.
+local PEER_GRACE = 10
+
 local function peerStep()
+	local now = os.clock()
 	for userId, peer in pairs(peers) do
-		if peer.equipped then
+		if peer.lostAt and now - peer.lostAt > PEER_GRACE then
+			dropPeer(userId)
+		elseif peer.equipped then
 			local holder = peerHolder(userId)
 			if holder then
 				holder.equipped = true
@@ -1785,8 +1993,7 @@ function Bridge.stop()
 	alive = false
 
 	for character, holder in pairs(holders) do
-		pcall(detach, holder)
-		holders[character] = nil
+		pcall(forget, character, holder)
 	end
 	for id in pairs(portals) do
 		local record = portals[id]
@@ -1798,17 +2005,8 @@ function Bridge.stop()
 	table.clear(pair.ids)
 	table.clear(peers)
 
-	if socket then
-		pcall(function()
-			if socket.Close then
-				socket:Close()
-			elseif socket.close then
-				socket:close()
-			end
-		end)
-		socket = nil
-	end
-	connected = false
+	socketGen += 1 -- so nothing a dying socket still delivers is acted on
+	dropSocket()
 
 	for i = #bin, 1, -1 do
 		local item = bin[i]
@@ -1827,7 +2025,9 @@ function Bridge.stop()
 	print("[PortalBridge] stopped")
 end
 
-
+--=========================================================================
+-- go
+--=========================================================================
 
 buildHud()
 setStatus("dialling " .. CONFIG.HOST .. " ...", Color3.fromRGB(240, 190, 110))
