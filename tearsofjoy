@@ -1,16 +1,64 @@
+--[[
+	PortalBridge - universal client script
+	=========================================================================
+	One file, run by BOTH players. There is no host and no guest: each client
+	is authoritative over its own character and its own shots, and mirrors the
+	other player's over the relay.
+
+	Studio -> executor, what moved where:
+	  ServerStorage.PortalGunModel      -> buildGun(), at runtime
+	  StarterPack.PortalGun             -> a Tool made client side, into Backpack
+	  PortalGunAim UnreliableRemoteEvent -> the relay's `a` frame, 30 Hz
+	  Character attr PortalGunAim       -> peer.aim, applied to a local C0
+	  PortalGunService grip + aim       -> rigOf() + poseStep()
+	  PortalService portals + travel    -> local, driven by `s` / `c` / `t`
+	  PortalGunAimClient                -> poseStep(), now for both characters
+	  PortalVisualsClient               -> visualStep()
+	  StarterGui.Cursor                 -> buildCursor()
+
+	R6 and R15 both. The aim rotates the right shoulder in either rig; the gun
+	grips the R6 "Right Arm" or the R15 "RightHand". Same joint algebra either
+	way:
+	    part1.CFrame = part0.CFrame * C0 * Transform * C1:Inverse()
+	The Animator owns Transform and rewrites it every frame, so every pose here
+	goes through C0 with that frame's Transform cancelled back out of it, on
+	PreSimulation. Nothing this script writes replicates - which is the whole
+	reason the relay exists.
+
+	The VIP-server gate is OFF (CONFIG.REQUIRE_VIP). PrivateServerId and
+	PrivateServerOwnerId are Not Replicated: a client reads "" and 0, so the check
+	can only ever refuse, and the relay cannot verify them either - whatever the
+	client sends is what it read, which is nothing. What does hold today is the
+	relay's token, its place allowlist, and its requirement that both players
+	report the same JobId. See README, "The VIP gate, and why it is off".
+]]
+
+--=========================================================================
+-- config
+--=========================================================================
+
 local CONFIG = {
 	HOST = "51.21.160.177",
 	PORT = 8080,
-	TLS = false,
+	TLS = false, -- ws:// on a bare IP; server/README.md has the wss path
 	TOKEN = "PA6U2IybuRXF1VL8mjuyCUKSkqp7GqblAacGNnsQf8U",
-	ROOM = "stockholm-1",
-	SEND_RATE = 30,
-	RECONNECT = 2,
+	ROOM = "stockholm-1", -- both players must use the same room
+
+	SEND_RATE = 30, -- aim frames per second
+	RECONNECT = 2, -- seconds between reconnect attempts
+	DEBUG = false,
+
+	-- OFF until production. PrivateServerId and PrivateServerOwnerId are both
+	-- tagged Not Replicated: a client reads "" and 0 and the engine warns
+	-- "cannot be checked on the client, please check on the server". So this gate
+	-- can only ever refuse, and the relay cannot check them either - whatever the
+	-- client sends is what it reads, which is nothing. See README, "The VIP gate".
+	REQUIRE_VIP = false,
 }
 
-local ammo = 10
-local cooldown = 1
-local key = Enum.KeyCode.T
+--=========================================================================
+-- guards, and one place to undo everything from
+--=========================================================================
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -19,26 +67,44 @@ local TweenService = game:GetService("TweenService")
 local Debris = game:GetService("Debris")
 local GuiService = game:GetService("GuiService")
 local AssetService = game:GetService("AssetService")
-local HttpService = game:GetService("HttpService")
-
-local abs, clamp, exp, floor, min = math.abs, math.clamp, math.exp, math.floor, math.min
-local atan2, asin, rad, sin, pi = math.atan2, math.asin, math.rad, math.sin, math.pi
 
 local LP = Players.LocalPlayer
 if not LP then
 	return
 end
 
-local ENV = (getgenv and getgenv()) or _G
-if ENV.PortalBridge and ENV.PortalBridge.stop then
-	pcall(ENV.PortalBridge.stop)
+-- Both of these are Not Replicated, so on a client they read "" and 0 and the
+-- engine logs a warning for even asking. Read them through pcall so F9 stays
+-- clean, and let the room's shared JobId be what actually pins the two players
+-- to one server instance (the relay enforces that).
+local function serverFact(name, fallback)
+	local ok, value = pcall(function()
+		return game[name]
+	end)
+	if ok and value ~= nil then
+		return value
+	end
+	return fallback
 end
 
-local Bridge = {}
+local PRIVATE_ID = serverFact("PrivateServerId", "")
+local PRIVATE_OWNER = serverFact("PrivateServerOwnerId", 0)
+
+if CONFIG.REQUIRE_VIP and (PRIVATE_ID == "" or PRIVATE_OWNER == 0) then
+	warn("[PortalBridge] not a VIP server (or this is a client read, which always says no) - refusing to run")
+	return
+end
+
+local ENV = (getgenv and getgenv()) or _G
+if ENV.PortalBridge and ENV.PortalBridge.stop then
+	pcall(ENV.PortalBridge.stop) -- re-executed: tear the old copy down first
+end
+
+local Bridge = { version = 1 }
 ENV.PortalBridge = Bridge
 
 local alive = true
-local bin = {}
+local bin = {} -- connections and instances, all undone by stop()
 
 local function keep(item)
 	bin[#bin + 1] = item
@@ -49,54 +115,84 @@ local function hook(signal, fn)
 	return keep(signal:Connect(fn))
 end
 
+local function log(...)
+	if CONFIG.DEBUG then
+		print("[PortalBridge]", ...)
+	end
+end
+
+-- Declared here because the portal code below needs it and the transport that
+-- assigns it comes further down.
 local send = function() end
 
-local function smooth(current, target, dt)
-	return current + (target - current) * (1 - exp(-dt * 16))
-end
+--=========================================================================
+-- assets and tunables, straight out of the Studio build
+--=========================================================================
 
-local function wrapAngle(angle)
-	return (angle + pi) % (pi * 2) - pi
-end
+local MESH_BODY = "rbxassetid://99500876350244"
+local MESH_GLASS = "rbxassetid://84936547362086"
+local TEX_GLASS = "rbxassetid://83468352205516"
+local PBR = {
+	ColorMap = "rbxassetid://118927373119668",
+	MetalnessMap = "rbxassetid://120670632165079",
+	NormalMap = "rbxassetid://81430572462498",
+	RoughnessMap = "rbxassetid://71354814860629",
+}
+local IMAGE_PORTAL = "rbxassetid://137327392378432"
+local IMAGE_CURSOR = "rbxassetid://187012669"
+local SOUNDS = {
+	Open = "rbxassetid://78687850811837",
+	Close = "rbxassetid://126308516153238",
+	Enter = "rbxassetid://129122193219354",
+}
 
-local function smoothAngle(current, target, dt)
-	return wrapAngle(current + wrapAngle(target - current) * (1 - exp(-dt * 16)))
-end
+local MAX_PITCH = math.rad(75)
+local YAW_ACROSS = math.rad(55) -- near edge of the across-the-chest wedge
+local YAW_BEHIND = math.rad(130) -- far edge of it
+local YAW_MARGIN = math.rad(12) -- hysteresis, so the arm cannot flip across it
+local YAW_MIDDLE = (YAW_ACROSS + YAW_BEHIND) / 2
+local RESPONSE = 16 -- smoothing rate, identical on both machines
+local AIM_RANGE = 2000
+local RELAXED = 0.002 -- blend at which the joint goes back to the Animator
+local PUBLISH_EPSILON = 0.004 -- ~0.23 deg: smaller changes are not worth sending
+local STALE_AFTER = 0.4 -- no aim for this long and the arm relaxes
+local ROLL_FROM = math.rad(30) -- yaw at which the arm starts rolling over
 
-local function clampYaw(yaw, current)
-	local across, behind = rad(55), rad(130)
-	if yaw <= across or yaw >= behind then
-		return yaw
-	end
+local SHOT_COOLDOWN = 0.35
+local RANGE = 300
+local PORTAL_SIZE = 12 -- studs across
+local PORTAL_LIGHT_RANGE = 24 -- scaled with the portal, or a 12 stud one looks unlit
+local ENTER_DEPTH = 2.5 -- how far either side of the plane counts as being in it
+local SURFACE_OFFSET = 0.1
+local FLUID_SPEED = 170
+local SPIN_SPEED = 22
+local GLOW = 2.4
+local PULSE, PULSE_RATE = 0.18, 2.5
+local OPEN_TIME, CLOSE_TIME = 0.25, 0.3
+local EXIT_OFFSET, EXIT_SPEED = 3.5, 22
+local TRAVEL_COOLDOWN = 1
+local START_AMMO = 10
+local YELLOW = Color3.fromRGB(255, 209, 92)
+local BUTTON_YELLOW = Color3.fromRGB(255, 221, 51)
+local CLEAR_KEY = Enum.KeyCode.T
 
-	local middle = (across + behind) * 0.5
-	if not current then
-		return yaw < middle and across or behind
-	end
+--=========================================================================
+-- the rig: R6 and R15 behind one shape
+--=========================================================================
 
-	local margin = rad(12)
-	if abs(wrapAngle(current - behind)) < abs(wrapAngle(current - across)) then
-		return yaw > middle - margin and behind or across
-	end
-	return yaw < middle + margin and across or behind
-end
+-- gun +X (the muzzle) -> the limb's -Y, gun +Y (its top) -> the limb's -Z.
+-- Reads as a natural pistol hold in either rig, because both hang a limb along
+-- its own -Y.
+local GRIP_ROT = CFrame.new(0, 0, 0, 0, 0, 1, -1, 0, 0, 0, -1, 0)
+local GRIP_R6 = CFrame.new(-0.026, -1.295, -0.55) * GRIP_ROT
 
-local function armRoll(yaw)
-	local from = rad(30)
-	local t = clamp((abs(yaw) - from) / (pi - from), 0, 1)
-	return pi * t * t * (3 - 2 * t) * (yaw < 0 and -1 or 1)
-end
+-- R6 hangs the arm off a point half a stud inside it, so the pivot slides out
+-- towards the middle of the arm's top face. R15's shoulder already sits near
+-- the top of the upper arm, so it needs much less.
+local SLIDE = { R6 = 0.5, R15 = 0.25 }
 
-local function armRotation(torsoCF, pitch, yaw)
-	local direction = torsoCF:VectorToWorldSpace(CFrame.fromEulerAnglesYXZ(pitch, yaw, 0).LookVector)
-	local up = abs(direction.Y) > 0.999 and Vector3.zAxis or Vector3.yAxis
-	return (
-		CFrame.lookAt(Vector3.zero, direction, up)
-		* CFrame.Angles(pi * 0.5, 0, 0)
-		* CFrame.Angles(0, armRoll(yaw), 0)
-	).Rotation
-end
-
+-- torso, the limb the shoulder swings, the shoulder joint, and the limb the gun
+-- is jointed to. nil for anything that is neither rig, or is not built yet.
 local function rigOf(character)
 	local upper = character:FindFirstChild("UpperTorso")
 	local arm = upper and character:FindFirstChild("RightUpperArm")
@@ -104,7 +200,6 @@ local function rigOf(character)
 	if shoulder and shoulder:IsA("Motor6D") then
 		return {
 			kind = "R15",
-			slide = 0.25,
 			torso = upper,
 			arm = arm,
 			shoulder = shoulder,
@@ -116,24 +211,90 @@ local function rigOf(character)
 	arm = torso and character:FindFirstChild("Right Arm")
 	shoulder = torso and torso:FindFirstChild("Right Shoulder")
 	if arm and shoulder and shoulder:IsA("Motor6D") then
-		return { kind = "R6", slide = 0.5, torso = torso, arm = arm, shoulder = shoulder, hand = arm }
+		return { kind = "R6", torso = torso, arm = arm, shoulder = shoulder, hand = arm }
 	end
 	return nil
 end
 
+-- R15 grips at the hand, so the offset comes off the hand's own size instead of
+-- reaching a whole arm's length down like R6 does.
 local function gripFor(rig)
-	local rotation = CFrame.new(0, 0, 0, 0, 0, 1, -1, 0, 0, 0, -1, 0)
 	if rig.kind == "R6" then
-		return CFrame.new(-0.026, -1.295, -0.55) * rotation
+		return GRIP_R6
 	end
-	local height = rig.hand and rig.hand.Size.Y or 0.3
-	return CFrame.new(-0.026, -(height * 0.5 + 0.18), -0.28) * rotation
+	local size = rig.hand and rig.hand.Size.Y or 0.3
+	return CFrame.new(-0.026, -(size * 0.5 + 0.18), -0.28) * GRIP_ROT
 end
 
+--=========================================================================
+-- joint algebra (was ReplicatedStorage.PortalGunShared)
+--=========================================================================
+
+local exp, atan2, asin, clamp, abs = math.exp, math.atan2, math.asin, math.clamp, math.abs
+local TAU, PI, HALF_PI = math.pi * 2, math.pi, math.pi / 2
+
+local function smooth(current, target, dt)
+	return current + (target - current) * (1 - exp(-dt * RESPONSE))
+end
+
+local function wrapAngle(angle)
+	return (angle + PI) % TAU - PI
+end
+
+-- Yaw travels the short way round: a cursor crossing the line straight behind
+-- the character steps yaw from +180 to -180, and smoothing that as a plain
+-- number swings the arm all the way around the front instead.
+local function smoothAngle(current, target, dt)
+	return wrapAngle(current + wrapAngle(target - current) * (1 - exp(-dt * RESPONSE)))
+end
+
+-- The reachable yaw is everything but the wedge across the chest, so a target in
+-- there goes to whichever edge is nearer. `current` makes that choice sticky -
+-- without it a cursor parked halfway across the wedge flips the whole arm
+-- between the two edges on nothing but mouse jitter and the torso's bob.
+local function clampYaw(yaw, current)
+	if yaw <= YAW_ACROSS or yaw >= YAW_BEHIND then
+		return yaw
+	end
+	if not current then
+		return yaw < YAW_MIDDLE and YAW_ACROSS or YAW_BEHIND
+	end
+	local onBehind = abs(wrapAngle(current - YAW_BEHIND)) < abs(wrapAngle(current - YAW_ACROSS))
+	if onBehind then
+		return yaw > YAW_MIDDLE - YAW_MARGIN and YAW_BEHIND or YAW_ACROSS
+	end
+	return yaw < YAW_MIDDLE + YAW_MARGIN and YAW_ACROSS or YAW_BEHIND
+end
+
+-- A real shoulder rotates as the arm swings back - point behind you and the palm
+-- ends up turned outwards - and doing the same keeps the arm's body on the
+-- outboard side of the shoulder the whole way round instead of driving it
+-- through the torso. No roll while the aim is ahead, easing to half a turn by
+-- straight behind, where +180 and -180 meet so yaw still crosses without a jump.
+local function armRoll(yaw)
+	local t = clamp((abs(yaw) - ROLL_FROM) / (PI - ROLL_FROM), 0, 1)
+	return PI * t * t * (3 - 2 * t) * (yaw < 0 and -1 or 1)
+end
+
+-- torso space aim -> the limb's world rotation. Both rigs point a limb down its
+-- own -Y, hence the quarter turn that puts -Y on the aim instead of -Z.
+local function armRotation(torsoCF, pitch, yaw)
+	local direction = torsoCF:VectorToWorldSpace(CFrame.fromEulerAnglesYXZ(pitch, yaw, 0).LookVector)
+	-- lookAt degenerates when its up vector lines up with the direction
+	local up = abs(direction.Y) > 0.999 and Vector3.zAxis or Vector3.yAxis
+	return (CFrame.lookAt(Vector3.zero, direction, up) * CFrame.Angles(HALF_PI, 0, 0) * CFrame.Angles(0, armRoll(yaw), 0)).Rotation
+end
+
+-- the point of the limb that stays put while it swings, in limb space
 local function armPivot(rig)
-	return rig.shoulder.C1.Position:Lerp(Vector3.new(0, rig.arm.Size.Y * 0.5, 0), rig.slide)
+	local top = Vector3.new(0, rig.arm.Size.Y * 0.5, 0)
+	return rig.shoulder.C1.Position:Lerp(top, SLIDE[rig.kind])
 end
 
+-- where the limb pivots in world space: the spot its pivot occupies with the arm
+-- at rest, so a relaxed arm sits exactly where the rig puts it and the pose has
+-- nothing to slide as it blends in. This is also the point the aim is measured
+-- from, so the arm points at the target from where it actually pivots.
 local function armAnchor(rig, torsoCF)
 	return (torsoCF * rig.rest * rig.shoulder.C1:Inverse() * CFrame.new(armPivot(rig))).Position
 end
@@ -143,19 +304,31 @@ local function armPose(rig, torsoCF, pitch, yaw)
 	return CFrame.new(armAnchor(rig, torsoCF) - rotation * armPivot(rig)) * rotation
 end
 
+-- C0 that reaches `armCF` in spite of whatever the Animator has just written into
+-- Transform. Every machine here poses through this: none of them owns Transform,
+-- and none of their C0 writes replicate.
 local function aimC0(rig, torsoCF, armCF)
 	return torsoCF:Inverse() * armCF * rig.shoulder.C1 * rig.shoulder.Transform:Inverse()
 end
+
+--=========================================================================
+-- the gun model (was ServerStorage.PortalGunModel)
+--=========================================================================
 
 local function decorate(part)
 	part.Anchored = false
 	part.Massless = true
 	part.CanCollide = false
-	part.CanQuery = false
+	part.CanQuery = false -- the gun must never be raycast, least of all by its own shots
 	part.CanTouch = false
 	return part
 end
 
+-- Studio had these two as MeshParts in ServerStorage. At runtime MeshPart.MeshId
+-- is not assignable, so the real path is AssetService:CreateMeshPartAsync, which
+-- also keeps SurfaceAppearance working (the gold PBR set). Where that is not
+-- available we fall back to a Part + SpecialMesh, which renders the mesh but
+-- takes a TextureID instead of the PBR maps - the gun looks flatter, and works.
 local function meshPart(meshId, size, textureId, pbr)
 	local ok, part = pcall(function()
 		return AssetService:CreateMeshPartAsync(meshId, {
@@ -163,7 +336,6 @@ local function meshPart(meshId, size, textureId, pbr)
 			RenderFidelity = Enum.RenderFidelity.Automatic,
 		})
 	end)
-
 	if ok and part then
 		part.Size = size
 		if textureId then
@@ -190,7 +362,7 @@ local function meshPart(meshId, size, textureId, pbr)
 	local mesh = Instance.new("SpecialMesh")
 	mesh.MeshType = Enum.MeshType.FileMesh
 	mesh.MeshId = meshId
-	mesh.Scale = size
+	mesh.Scale = size -- no native mesh bounds to read here; tune if it looks off
 	if textureId then
 		mesh.TextureId = textureId
 	end
@@ -198,34 +370,66 @@ local function meshPart(meshId, size, textureId, pbr)
 	return decorate(fallback)
 end
 
-local function buildAmmoScreen(body)
-	local screen = decorate(Instance.new("Part"))
+local GUN_BODY_SIZE = Vector3.new(2.281, 1.837, 1.340)
+
+-- The whole gun, welded together, ready to be jointed to a limb. Built once per
+-- character that draws one - so twice on each machine, once for each player.
+local function buildGun()
+	local model = Instance.new("Model")
+	model.Name = "PortalGunModel"
+
+	local body = meshPart(MESH_BODY, GUN_BODY_SIZE, nil, PBR)
+	body.Name = "PortalGun_Body"
+	body.Color = Color3.fromRGB(163, 162, 165)
+	body.Material = Enum.Material.Plastic
+	body.Parent = model
+	model.PrimaryPart = body
+
+	local glass = meshPart(MESH_GLASS, Vector3.new(1.083, 0.850, 1.226), TEX_GLASS)
+	glass.Name = "PortalGun_Glass"
+	glass.Material = Enum.Material.Glass
+	glass.Transparency = 0.6
+	glass.Color = Color3.fromRGB(163, 162, 165)
+	glass.CFrame = body.CFrame * CFrame.new(0.2751, 0.4166, 0)
+	glass.Parent = model
+
+	local weld = Instance.new("WeldConstraint")
+	weld.Part0, weld.Part1 = body, glass
+	weld.Parent = body
+
+	-- the ammo readout: a separate little plate so the number can be a real
+	-- TextLabel rather than baked into a texture
+	local screen = Instance.new("Part")
 	screen.Name = "AmmoScreen"
 	screen.Size = Vector3.new(0.379, 0.348, 0.024)
 	screen.Material = Enum.Material.ForceField
 	screen.Transparency = 0.85
 	screen.Color = Color3.fromRGB(202, 203, 209)
 	screen.CastShadow = false
+	decorate(screen)
+	-- the front face ends up along the body's +Y (the top of the gun) and the
+	-- label's own +Y runs up the barrel; this is the whole orientation, not an
+	-- offset to eyeball
 	screen.CFrame = body.CFrame * CFrame.new(-0.7591, 0.3119, -0.1452, 0, 1, 0, 0, 0, -1, -1, 0, 0)
 	screen.Parent = body
 
-	local weld = Instance.new("WeldConstraint")
-	weld.Part0, weld.Part1 = body, screen
-	weld.Parent = screen
+	local screenWeld = Instance.new("WeldConstraint")
+	screenWeld.Part0, screenWeld.Part1 = body, screen
+	screenWeld.Parent = screen
 
 	local gui = Instance.new("SurfaceGui")
 	gui.Name = "Display"
 	gui.Face = Enum.NormalId.Front
 	gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
 	gui.PixelsPerStud = 400
-	gui.LightInfluence = 0
+	gui.LightInfluence = 0 -- so the number reads as neon in any lighting
 	gui.Brightness = 2
 	gui.AlwaysOnTop = false
 	gui.Parent = screen
 
 	local count = Instance.new("TextLabel")
 	count.Name = "Count"
-	count.Text = tostring(ammo)
+	count.Text = tostring(START_AMMO)
 	count.Font = Enum.Font.Arcade
 	count.TextColor3 = Color3.fromRGB(255, 221, 51)
 	count.TextScaled = true
@@ -238,44 +442,15 @@ local function buildAmmoScreen(body)
 	count.Size = UDim2.fromScale(0.92, 0.92)
 	count.Parent = gui
 
-	return count
+	return model, count
 end
 
-local function buildGun()
-	local model = Instance.new("Model")
-	model.Name = "PortalGunModel"
+--=========================================================================
+-- one character's gun and pose state
+--=========================================================================
 
-	local body = meshPart("rbxassetid://99500876350244", Vector3.new(2.281, 1.837, 1.340), nil, {
-		ColorMap = "rbxassetid://118927373119668",
-		MetalnessMap = "rbxassetid://120670632165079",
-		NormalMap = "rbxassetid://81430572462498",
-		RoughnessMap = "rbxassetid://71354814860629",
-	})
-	body.Name = "PortalGun_Body"
-	body.Color = Color3.fromRGB(163, 162, 165)
-	body.Material = Enum.Material.Plastic
-	body.Parent = model
-	model.PrimaryPart = body
-
-	local glass = meshPart(
-		"rbxassetid://84936547362086",
-		Vector3.new(1.083, 0.850, 1.226),
-		"rbxassetid://83468352205516"
-	)
-	glass.Name = "PortalGun_Glass"
-	glass.Material = Enum.Material.Glass
-	glass.Transparency = 0.6
-	glass.Color = Color3.fromRGB(163, 162, 165)
-	glass.CFrame = body.CFrame * CFrame.new(0.2751, 0.4166, 0)
-	glass.Parent = model
-
-	local weld = Instance.new("WeldConstraint")
-	weld.Part0, weld.Part1 = body, glass
-	weld.Parent = body
-
-	return model, buildAmmoScreen(body)
-end
-
+-- character -> holder. Weak keyed, so a character that goes away takes its entry
+-- with it whether or not the loop below notices first.
 local holders = setmetatable({}, { __mode = "k" })
 
 local function detach(holder)
@@ -283,7 +458,7 @@ local function detach(holder)
 		return
 	end
 	if holder.rig and holder.rig.shoulder.Parent then
-		holder.rig.shoulder.C0 = holder.rig.rest
+		holder.rig.shoulder.C0 = holder.rig.rest -- hand the joint back to the Animator
 	end
 	if holder.motor then
 		holder.motor:Destroy()
@@ -291,10 +466,13 @@ local function detach(holder)
 	if holder.gun then
 		holder.gun:Destroy()
 	end
-	holder.motor, holder.gun, holder.count, holder.barrel = nil, nil, nil, nil
+	holder.motor, holder.gun, holder.count = nil, nil, nil
 	holder.posed = false
 end
 
+-- Studio made this Motor6D on the server so the grip replicated. Here nothing
+-- replicates, so each machine makes its own for each character - which is the
+-- same result by a different road, and the reason both guns are built locally.
 local function attach(holder)
 	local rig = holder.rig
 	if not rig or holder.motor then
@@ -303,8 +481,9 @@ local function attach(holder)
 
 	local gun, count = buildGun()
 	local grip = gripFor(rig)
-	gun.Parent = holder.character
-	gun:PivotTo(rig.hand.CFrame * grip)
+	gun.Parent = holder.character -- a sibling of the limbs, not under the Tool
+	gun:PivotTo(rig.hand.CFrame * grip) -- in place before it is jointed, or it
+	                                    -- flashes at the origin for a frame
 
 	local motor = Instance.new("Motor6D")
 	motor.Name = "PortalGunGrip"
@@ -315,26 +494,30 @@ local function attach(holder)
 
 	holder.gun, holder.motor, holder.count = gun, motor, count
 	holder.barrel = gun.PrimaryPart
-	if holder.rounds then
-		count.Text = tostring(holder.rounds)
+	if holder.ammo then
+		count.Text = tostring(holder.ammo)
 	end
 end
 
+-- Built the first time a character actually needs one rather than off
+-- CharacterAdded: a rig assembled by hand (EnforceR6 and the like) can be a
+-- frame or two behind the character appearing, and a rig that was not ready then
+-- used to be missed for the rest of that life.
 local function holderFor(character)
 	local holder = holders[character]
 	if holder then
 		if holder.rig.torso.Parent and holder.rig.shoulder.Parent then
 			return holder
 		end
-		holders[character] = nil
+		holders[character] = nil -- the rig went away under us
 		return nil
 	end
 
 	local rig = rigOf(character)
 	if not rig then
-		return nil
+		return nil -- neither rig, or not built yet; the next frame tries again
 	end
-	rig.rest = rig.shoulder.C0
+	rig.rest = rig.shoulder.C0 -- read before anything below writes it
 
 	holder = {
 		character = character,
@@ -342,35 +525,48 @@ local function holderFor(character)
 		pitch = 0,
 		yaw = 0,
 		blend = 0,
+		posed = false,
+		equipped = false,
+		ammo = nil,
+		point = nil, -- world point being aimed at (local player only)
+		pointAt = 0,
 		wantPitch = 0,
 		wantYaw = 0,
 		wantBlend = 0,
-		posed = false,
-		equipped = false,
-		point = nil,
-		pointAt = 0,
 	}
 	holders[character] = holder
 	return holder
 end
 
+--=========================================================================
+-- the pose loop (was PortalGunAimClient, now for both characters)
+--=========================================================================
+
+-- PreSimulation is after the Animator has evaluated this frame and before physics
+-- moves anything, so cancelling Transform out of C0 is exact. On PostSimulation
+-- the next frame's animation overwrites the write.
 local function poseStep(dt)
 	for character, holder in pairs(holders) do
+		if not character.Parent then
+			holders[character] = nil
+			continue
+		end
 		local rig = holder.rig
-		if not (character.Parent and rig.torso.Parent and rig.shoulder.Parent and rig.arm.Parent) then
+		if not (rig.torso.Parent and rig.shoulder.Parent and rig.arm.Parent) then
 			holders[character] = nil
 			continue
 		end
 
-		if holder.wantBlend <= 0 and not holder.posed then
-			continue
+		local wantPitch, wantYaw, wantBlend = holder.wantPitch, holder.wantYaw, holder.wantBlend
+		if wantBlend <= 0 and not holder.posed then
+			continue -- relaxed, and already handed back to the Animator
 		end
 
-		holder.pitch = smooth(holder.pitch, holder.wantPitch, dt)
-		holder.yaw = smoothAngle(holder.yaw, holder.wantYaw, dt)
-		holder.blend = smooth(holder.blend, holder.wantBlend, dt)
+		holder.pitch = smooth(holder.pitch, wantPitch, dt)
+		holder.yaw = smoothAngle(holder.yaw, wantYaw, dt)
+		holder.blend = smooth(holder.blend, wantBlend, dt)
 
-		if holder.blend <= 0.002 then
+		if holder.blend <= RELAXED then
 			holder.blend = 0
 			holder.posed = false
 			rig.shoulder.C0 = rig.rest
@@ -383,6 +579,10 @@ local function poseStep(dt)
 	end
 end
 
+--=========================================================================
+-- portals (was ServerScriptService.PortalService, now local on both machines)
+--=========================================================================
+
 local folder = workspace:FindFirstChild("PortalBridgePortals")
 if not folder then
 	folder = Instance.new("Folder")
@@ -391,10 +591,16 @@ if not folder then
 end
 keep(folder)
 
-local portals = {}
+local portals = {} -- id -> record
+-- One pair for the whole session, not one per player. Either player's portal
+-- pairs with the other's, so A can drop one end and B the other - which is what
+-- makes the bridge worth having and is the one place this deliberately parts
+-- company with the Studio build.
 local pair = { ids = {} }
-local travelling = setmetatable({}, { __mode = "k" })
+local travelling = setmetatable({}, { __mode = "k" }) -- character -> clock
 
+-- One shot each, on a host that outlives the portal, so a portal collapsing does
+-- not cut its own closing sound off.
 local function playAt(position, kind)
 	local host = Instance.new("Part")
 	host.Name = "PortalSound"
@@ -408,18 +614,14 @@ local function playAt(position, kind)
 	host.Parent = folder
 
 	local sound = Instance.new("Sound")
-	sound.SoundId = ({
-		Open = "rbxassetid://78687850811837",
-		Close = "rbxassetid://126308516153238",
-		Enter = "rbxassetid://129122193219354",
-	})[kind]
+	sound.SoundId = SOUNDS[kind]
 	sound.RollOffMaxDistance = 150
 	sound.Parent = host
 	sound:Play()
 	sound.Ended:Once(function()
 		host:Destroy()
 	end)
-	Debris:AddItem(host, 8)
+	Debris:AddItem(host, 8) -- a sound ID that never loads never raises Ended
 end
 
 local function forgetId(id)
@@ -439,18 +641,175 @@ local function closePortal(id)
 	end
 	record.closing = true
 	portals[id] = nil
-	forgetId(id)
-
+	forgetId(id) -- or a dead id would count towards the pair and trim a live one
 	playAt(record.plate.Position, "Close")
 	TweenService:Create(
 		record.image,
-		TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+		TweenInfo.new(CLOSE_TIME, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
 		{ Size = UDim2.fromScale(0, 0), ImageTransparency = 1 }
 	):Play()
-	TweenService:Create(record.light, TweenInfo.new(0.3), { Brightness = 0, Range = 0 }):Play()
-	task.delay(0.3, function()
+	TweenService:Create(record.light, TweenInfo.new(CLOSE_TIME), { Brightness = 0, Range = 0 }):Play()
+	task.delay(CLOSE_TIME, function()
 		record.model:Destroy()
 	end)
+end
+
+local function openPortal(owner, n, position, normal)
+	local id = owner .. ":" .. n
+	if portals[id] then
+		return
+	end
+	-- lookAt needs an up vector that is not the normal itself, which floors and
+	-- ceilings would otherwise hand it
+	local up = abs(normal.Y) > 0.99 and Vector3.zAxis or Vector3.yAxis
+
+	local model = Instance.new("Model")
+	model.Name = "Portal"
+
+	local plate = Instance.new("Part")
+	plate.Name = "Plate"
+	plate.Size = Vector3.new(PORTAL_SIZE, PORTAL_SIZE, 0.2)
+	-- the plate's LookVector IS the surface normal, which is what travel later
+	-- reads as "out of the portal"
+	plate.CFrame = CFrame.lookAt(position, position + normal, up)
+	plate.Anchored = true
+	plate.CanCollide = false
+	plate.CanQuery = false -- so the next shot flies through a portal, not into it
+	plate.CanTouch = false -- travel is a local box test, not a Touched event
+	plate.CastShadow = false
+	plate.Transparency = 1 -- the image is the only visible thing
+	plate.Parent = model
+	model.PrimaryPart = plate
+
+	local gui = Instance.new("SurfaceGui")
+	gui.Face = Enum.NormalId.Front
+	gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+	gui.PixelsPerStud = 64
+	gui.LightInfluence = 0 -- a portal glows on its own
+	gui.Brightness = 2
+	gui.Parent = plate
+
+	local image = Instance.new("ImageLabel")
+	image.Name = "Image"
+	image.Image = IMAGE_PORTAL
+	image.BackgroundTransparency = 1
+	image.AnchorPoint = Vector2.new(0.5, 0.5)
+	image.Position = UDim2.fromScale(0.5, 0.5)
+	image.Size = UDim2.fromScale(0, 0) -- opens below
+	image.Parent = gui
+
+	local light = Instance.new("PointLight")
+	light.Color = YELLOW
+	light.Brightness = 0
+	light.Range = 0
+	light.Shadows = false
+	light.Parent = plate
+
+	model.Parent = folder
+
+	TweenService:Create(
+		image,
+		TweenInfo.new(OPEN_TIME, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+		{ Size = UDim2.fromScale(1, 1) }
+	):Play()
+	TweenService:Create(light, TweenInfo.new(OPEN_TIME), { Brightness = GLOW, Range = PORTAL_LIGHT_RANGE }):Play()
+	playAt(position, "Open")
+
+	local record = {
+		id = id,
+		n = n,
+		owner = owner,
+		model = model,
+		plate = plate,
+		image = image,
+		light = light,
+		open = false,
+		bornAt = os.clock(),
+	}
+	portals[id] = record
+	task.delay(OPEN_TIME, function()
+		if not record.closing then
+			record.open = true -- the visual pulse may start, and travel may fire
+		end
+	end)
+
+	table.insert(pair.ids, id)
+	return record
+end
+
+-- the glob of fluid, on its way to where the portal will open. Pure decoration:
+-- the shot's outcome was decided by the shooter's raycast before this flew.
+local function shootFluid(origin, landing, onArrival)
+	local glob = Instance.new("Part")
+	glob.Name = "PortalFluid"
+	glob.Shape = Enum.PartType.Ball
+	glob.Size = Vector3.one * 0.7
+	glob.Material = Enum.Material.Neon
+	glob.Color = YELLOW
+	glob.CFrame = CFrame.new(origin)
+	glob.Anchored = true
+	glob.CanCollide = false
+	glob.CanQuery = false
+	glob.CanTouch = false
+	glob.CastShadow = false
+
+	local light = Instance.new("PointLight")
+	light.Color = YELLOW
+	light.Brightness = 3
+	light.Range = 10
+	light.Shadows = false
+	light.Parent = glob
+
+	-- a tail, so it reads as fluid thrown rather than a bullet
+	local top, tail = Instance.new("Attachment"), Instance.new("Attachment")
+	top.Position = Vector3.new(0, 0.3, 0)
+	tail.Position = Vector3.new(0, -0.3, 0)
+	top.Parent, tail.Parent = glob, glob
+	local trail = Instance.new("Trail")
+	trail.Attachment0, trail.Attachment1 = top, tail
+	trail.Color = ColorSequence.new(YELLOW)
+	trail.Transparency = NumberSequence.new(0.2, 1)
+	trail.Lifetime = 0.22
+	trail.LightEmission = 1
+	trail.Parent = glob
+	glob.Parent = folder
+
+	local flight = math.max((landing - origin).Magnitude / FLUID_SPEED, 0.05)
+	TweenService:Create(glob, TweenInfo.new(flight, Enum.EasingStyle.Linear), { CFrame = CFrame.new(landing) }):Play()
+	Debris:AddItem(glob, flight + 1) -- the glob goes even if the shot is cut short
+	task.delay(flight, function()
+		glob:Destroy()
+		if onArrival then
+			onArrival()
+		end
+	end)
+end
+
+-- Both machines run this off the same `s` frame, so they open the same portal in
+-- the same place with the same id. Portals no longer expire on a clock - they
+-- stand until the third one pushes the oldest out, or until somebody clears.
+local function arrive(owner, n, hit, position, normal)
+	if not hit then
+		return -- nothing solid out there: the fluid just goes
+	end
+	if not openPortal(owner, n, position, normal) then
+		return
+	end
+	while #pair.ids > 2 do
+		closePortal(pair.ids[1]) -- the oldest gives way; closePortal un-lists it
+	end
+end
+
+-- The other open portal, whoever shot it. This is the change that lets one player
+-- drop one end and the other player the other.
+local function partner(record)
+	for _, id in ipairs(pair.ids) do
+		local other = portals[id]
+		if other and other ~= record and other.open and not other.closing then
+			return other
+		end
+	end
+	return nil
 end
 
 local function clearPortals(announce)
@@ -463,156 +822,21 @@ local function clearPortals(announce)
 	end
 end
 
-local function buildPlate(position, normal)
-	local up = abs(normal.Y) > 0.99 and Vector3.zAxis or Vector3.yAxis
+--=========================================================================
+-- travel: only ever this machine's own character
+--=========================================================================
 
-	local model = Instance.new("Model")
-	model.Name = "Portal"
-
-	local plate = Instance.new("Part")
-	plate.Name = "Plate"
-	plate.Size = Vector3.new(12, 12, 0.2)
-	plate.CFrame = CFrame.lookAt(position, position + normal, up)
-	plate.Anchored = true
-	plate.CanCollide = false
-	plate.CanQuery = false
-	plate.CanTouch = false
-	plate.CastShadow = false
-	plate.Transparency = 1
-	plate.Parent = model
-	model.PrimaryPart = plate
-
-	local gui = Instance.new("SurfaceGui")
-	gui.Face = Enum.NormalId.Front
-	gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
-	gui.PixelsPerStud = 64
-	gui.LightInfluence = 0
-	gui.Brightness = 2
-	gui.Parent = plate
-
-	local image = Instance.new("ImageLabel")
-	image.Name = "Image"
-	image.Image = "rbxassetid://137327392378432"
-	image.BackgroundTransparency = 1
-	image.AnchorPoint = Vector2.new(0.5, 0.5)
-	image.Position = UDim2.fromScale(0.5, 0.5)
-	image.Size = UDim2.fromScale(0, 0)
-	image.Parent = gui
-
-	local light = Instance.new("PointLight")
-	light.Color = Color3.fromRGB(255, 209, 92)
-	light.Brightness = 0
-	light.Range = 0
-	light.Shadows = false
-	light.Parent = plate
-
-	return model, plate, image, light
-end
-
-local function openPortal(owner, n, position, normal)
-	local id = owner .. ":" .. n
-	if portals[id] then
-		return nil
-	end
-
-	local model, plate, image, light = buildPlate(position, normal)
-	model.Parent = folder
-
-	TweenService:Create(
-		image,
-		TweenInfo.new(0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
-		{ Size = UDim2.fromScale(1, 1) }
-	):Play()
-	TweenService:Create(light, TweenInfo.new(0.25), { Brightness = 2.4, Range = 24 }):Play()
-	playAt(position, "Open")
-
-	local record = {
-		id = id,
-		n = n,
-		owner = owner,
-		model = model,
-		plate = plate,
-		image = image,
-		light = light,
-		open = false,
-	}
-	portals[id] = record
-	table.insert(pair.ids, id)
-
-	task.delay(0.25, function()
-		if not record.closing then
-			record.open = true
-		end
-	end)
-	return record
-end
-
-local function arrive(owner, n, hit, position, normal)
-	if not hit or not openPortal(owner, n, position, normal) then
-		return
-	end
-	while #pair.ids > 2 do
-		closePortal(pair.ids[1])
-	end
-end
-
-local function partner(record)
-	for _, id in ipairs(pair.ids) do
-		local other = portals[id]
-		if other and other ~= record and other.open and not other.closing then
-			return other
-		end
-	end
-	return nil
-end
-
-local function shootFluid(origin, landing, onArrival)
-	local yellow = Color3.fromRGB(255, 209, 92)
-
-	local glob = Instance.new("Part")
-	glob.Name = "PortalFluid"
-	glob.Shape = Enum.PartType.Ball
-	glob.Size = Vector3.one * 0.7
-	glob.Material = Enum.Material.Neon
-	glob.Color = yellow
-	glob.CFrame = CFrame.new(origin)
-	glob.Anchored = true
-	glob.CanCollide = false
-	glob.CanQuery = false
-	glob.CanTouch = false
-	glob.CastShadow = false
-
-	local light = Instance.new("PointLight")
-	light.Color = yellow
-	light.Brightness = 3
-	light.Range = 10
-	light.Shadows = false
-	light.Parent = glob
-
-	local top, tail = Instance.new("Attachment"), Instance.new("Attachment")
-	top.Position = Vector3.new(0, 0.3, 0)
-	tail.Position = Vector3.new(0, -0.3, 0)
-	top.Parent, tail.Parent = glob, glob
-
-	local trail = Instance.new("Trail")
-	trail.Attachment0, trail.Attachment1 = top, tail
-	trail.Color = ColorSequence.new(yellow)
-	trail.Transparency = NumberSequence.new(0.2, 1)
-	trail.Lifetime = 0.22
-	trail.LightEmission = 1
-	trail.Parent = glob
-	glob.Parent = folder
-
-	local flight = math.max((landing - origin).Magnitude / 170, 0.05)
-	TweenService:Create(glob, TweenInfo.new(flight, Enum.EasingStyle.Linear), { CFrame = CFrame.new(landing) }):Play()
-	Debris:AddItem(glob, flight + 1)
-	task.delay(flight, function()
-		glob:Destroy()
-		if onArrival then
-			onArrival()
-		end
-	end)
-end
+-- Nothing in a portal is collidable - the plate is CanCollide false and CanQuery
+-- false - so what stopped a floor portal working was the trigger, not a hitbox.
+-- The old test was a point test at HumanoidRootPart, which on a floor portal sits
+-- about three studs ABOVE the plate: standing right on one, the root was never
+-- within the slab, so it never fired. Walls worked because there the root is at
+-- the plate's own height.
+--
+-- So the character is treated as what it is: a standing segment from under the
+-- feet to over the head, tested against the portal's slab as a box. Exact for a
+-- floor, a ceiling, a wall and everything between, with no special casing.
+local HALF = PORTAL_SIZE * 0.5
 
 local function slab(origin, delta, half, tmin, tmax)
 	if abs(delta) < 1e-6 then
@@ -621,7 +845,6 @@ local function slab(origin, delta, half, tmin, tmax)
 		end
 		return tmin, tmax
 	end
-
 	local t1, t2 = (-half - origin) / delta, (half - origin) / delta
 	if t1 > t2 then
 		t1, t2 = t2, t1
@@ -638,31 +861,40 @@ local function slab(origin, delta, half, tmin, tmax)
 	return tmin, tmax
 end
 
-local function insidePortal(record, top, bottom)
-	local cf = record.plate.CFrame
-	local a, b = cf:PointToObjectSpace(top), cf:PointToObjectSpace(bottom)
-
-	local tmin, tmax = slab(a.X, b.X - a.X, 6, 0, 1)
+local function segmentInBox(a, b, hx, hy, hz)
+	local tmin, tmax = 0, 1
+	tmin, tmax = slab(a.X, b.X - a.X, hx, tmin, tmax)
 	if not tmin then
 		return false
 	end
-	tmin, tmax = slab(a.Y, b.Y - a.Y, 6, tmin, tmax)
+	tmin, tmax = slab(a.Y, b.Y - a.Y, hy, tmin, tmax)
 	if not tmin then
 		return false
 	end
-	return (slab(a.Z, b.Z - a.Z, 2.5, tmin, tmax)) ~= nil
+	tmin, tmax = slab(a.Z, b.Z - a.Z, hz, tmin, tmax)
+	return tmin ~= nil
 end
 
+local function insidePortal(record, top, bottom)
+	local cf = record.plate.CFrame
+	return segmentInBox(cf:PointToObjectSpace(top), cf:PointToObjectSpace(bottom), HALF, HALF, ENTER_DEPTH)
+end
+
+-- Anyone may use anyone's portals: this never checks who shot the one it steps
+-- into. With one shared pair that is the whole point.
 local function doTravel(record, exit, root)
-	local out = exit.plate.CFrame.LookVector
+	local out = exit.plate.CFrame.LookVector -- the exit surface's normal
 	local flat = Vector3.new(out.X, 0, out.Z)
+	-- a portal on a floor or a ceiling has no facing to give, so keep your own
 	local facing = flat.Magnitude > 0.1 and flat.Unit or root.CFrame.LookVector
-	local landing = exit.plate.Position + out * 3.5
+	local landing = exit.plate.Position + out * EXIT_OFFSET
+	local speed = math.max(root.AssemblyLinearVelocity.Magnitude, EXIT_SPEED)
 
 	root.CFrame = CFrame.lookAt(landing, landing + facing)
-	root.AssemblyLinearVelocity = out * math.max(root.AssemblyLinearVelocity.Magnitude, 22)
+	root.AssemblyLinearVelocity = out * speed
 	playAt(record.plate.Position, "Enter")
-	playAt(exit.plate.Position, "Enter")
+	playAt(exit.plate.Position, "Enter") -- both ends, which is what makes a pair
+	                                     -- feel connected
 end
 
 local function travelStep()
@@ -681,19 +913,22 @@ local function travelStep()
 
 	local now = os.clock()
 	if (travelling[character] or 0) > now then
-		return
+		return -- came out of a portal a moment ago; do not bounce straight back
 	end
 
+	-- the standing segment: HipHeight covers the legs on both rigs, and the extra
+	-- stud each end covers the head and any small float above the floor
+	local up = Vector3.yAxis
 	local rootHalf = root.Size.Y * 0.5
-	local top = root.Position + Vector3.yAxis * (rootHalf + 2)
-	local bottom = root.Position - Vector3.yAxis * (rootHalf + (humanoid.HipHeight or 2) + 1)
+	local top = root.Position + up * (rootHalf + 2)
+	local bottom = root.Position - up * (rootHalf + (humanoid.HipHeight or 2) + 1)
 
 	for _, id in ipairs(pair.ids) do
 		local record = portals[id]
 		if record and record.open and not record.closing and insidePortal(record, top, bottom) then
 			local exit = partner(record)
-			if exit then
-				travelling[character] = now + cooldown
+			if exit then -- one portal on its own goes nowhere
+				travelling[character] = now + TRAVEL_COOLDOWN
 				doTravel(record, exit, root)
 				send("t" .. record.owner .. "," .. record.n .. "," .. exit.n)
 				return
@@ -702,19 +937,47 @@ local function travelStep()
 	end
 end
 
+--=========================================================================
+-- portal visuals (was PortalVisualsClient)
+--=========================================================================
+
+-- Sixty property updates a second each for something no two machines have to
+-- agree on, so each does it for itself and none of it crosses the bridge. The
+-- iteration is over the live record table rather than folder:GetChildren(), so
+-- there is no allocation per frame.
 local function visualStep(dt)
 	local clock = os.clock()
 	for _, record in pairs(portals) do
 		if not record.closing then
-			record.image.Rotation = (record.image.Rotation + 22 * dt) % 360
+			record.image.Rotation = (record.image.Rotation + SPIN_SPEED * dt) % 360
 			if record.open then
-				record.light.Brightness = 2.4 * (1 + 0.18 * sin(clock * 2.5))
+				record.light.Brightness = GLOW * (1 + PULSE * math.sin(clock * PULSE_RATE))
 			end
 		end
 	end
 end
 
-local fields = table.create(16)
+-- Portals have no clock any more. They stand until the third one pushes the
+-- oldest out or somebody hits CLEAR, which is what the clear control is for.
+
+--=========================================================================
+-- the wire protocol
+--=========================================================================
+-- Terse on purpose: the aim frame goes 30 times a second and JSON would be four
+-- times the bytes for no gain. One letter of kind, then integers.
+--   client -> relay   a<p>,<y>,<b>                       aim
+--                     s<n>,<mx,my,mz>,<lx,ly,lz>,<h>[,<nx,ny,nz>]   shot
+--                     c<id>                              close one
+--                     x                                  clear every portal
+--                     t<owner>,<fromN>,<toN>             travel
+--                     m<ammo>                            ammo
+--                     e<0|1>                             equipped
+--   relay -> client   the same frame with the sender's user id spliced in after
+--                     the letter, so a client cannot claim to be the other one.
+-- Angles are radians x 10000, positions studs x 100.
+
+local HttpService = game:GetService("HttpService")
+local floor = math.floor
 
 local function q(n, scale)
 	return tostring(floor(n * scale + 0.5))
@@ -724,11 +987,14 @@ local function packV3(v)
 	return q(v.X, 100) .. "," .. q(v.Y, 100) .. "," .. q(v.Z, 100)
 end
 
+-- one reusable buffer: the aim path runs 30 times a second and should not be
+-- handing the collector a new table each time
+local fields = table.create(16)
+
 local function split(text, from)
 	local n = 0
-	local length = #text
 	table.clear(fields)
-
+	local length = #text
 	while from <= length do
 		local comma = string.find(text, ",", from, true)
 		n += 1
@@ -742,6 +1008,10 @@ local function split(text, from)
 	end
 	return n
 end
+
+--=========================================================================
+-- transport
+--=========================================================================
 
 local SOCKET_FACTORIES = {
 	function()
@@ -758,6 +1028,8 @@ local SOCKET_FACTORIES = {
 	end,
 }
 
+-- Executors do not agree on where the WebSocket lives or whether its methods are
+-- called with a colon, so both are probed rather than assumed.
 local function socketConnect(url)
 	for _, factory in ipairs(SOCKET_FACTORIES) do
 		local ok, connect = pcall(factory)
@@ -766,6 +1038,7 @@ local function socketConnect(url)
 			if opened and socket then
 				return socket
 			end
+			log("connect failed:", socket)
 		end
 	end
 	return nil
@@ -773,7 +1046,8 @@ end
 
 local function socketSend(socket, text)
 	if socket.Send then
-		if pcall(socket.Send, socket, text) then
+		local ok = pcall(socket.Send, socket, text)
+		if ok then
 			return true
 		end
 		return pcall(socket.Send, text)
@@ -788,9 +1062,8 @@ local URL = (CONFIG.TLS and "wss://" or "ws://") .. CONFIG.HOST .. ":" .. CONFIG
 
 local socket = nil
 local connected = false
-local peers = {}
-local statusLabel
-local onFrame
+local peers = {} -- userId -> peer state
+local onFrame -- assigned below, once the handlers exist
 
 send = function(text)
 	if connected and socket then
@@ -798,21 +1071,13 @@ send = function(text)
 	end
 end
 
+local statusLabel -- the HUD's connection line, built further down
+
 local function setStatus(text, colour)
 	if statusLabel then
 		statusLabel.Text = text
 		statusLabel.TextColor3 = colour
 	end
-end
-
-local function serverFact(name, fallback)
-	local ok, value = pcall(function()
-		return game[name]
-	end)
-	if ok and value ~= nil then
-		return value
-	end
-	return fallback
 end
 
 local function handshake()
@@ -823,10 +1088,15 @@ local function handshake()
 		token = CONFIG.TOKEN,
 		uid = LP.UserId,
 		name = LP.Name,
+		-- JobId is replicated, so this one is real: the relay refuses a room whose
+		-- two members report different server instances, which is the check that
+		-- actually stops a room bridging two places together.
 		job = game.JobId,
 		place = game.PlaceId,
-		ps = serverFact("PrivateServerId", ""),
-		owner = serverFact("PrivateServerOwnerId", 0),
+		-- these two are "" and 0 from a client; sent anyway so a future server-fed
+		-- build needs no protocol change
+		ps = PRIVATE_ID,
+		owner = PRIVATE_OWNER,
 		ts = os.time(),
 		nonce = HttpService:GenerateGUID(false),
 	})
@@ -838,14 +1108,14 @@ local function dropPeer(userId)
 		return
 	end
 	peers[userId] = nil
-
+	-- their end of the pair goes with them: nothing here can re-sync a portal
+	-- whose owner has left
 	for index = #pair.ids, 1, -1 do
 		local record = portals[pair.ids[index]]
 		if record and record.owner == userId then
 			closePortal(record.id)
 		end
 	end
-
 	if peer.character then
 		local holder = holders[peer.character]
 		if holder then
@@ -856,13 +1126,14 @@ local function dropPeer(userId)
 	end
 end
 
+-- Peers are found by user id, not by name, and their character is re-resolved
+-- each time rather than cached across a respawn.
 local function peerHolder(userId)
 	local peer = peers[userId]
 	if not peer then
 		peer = {}
 		peers[userId] = peer
 	end
-
 	local player = peer.player
 	if not (player and player.Parent) then
 		player = Players:GetPlayerByUserId(userId)
@@ -871,7 +1142,6 @@ local function peerHolder(userId)
 	if not player then
 		return nil, peer
 	end
-
 	local character = player.Character
 	if not (character and character.Parent) then
 		return nil, peer
@@ -880,40 +1150,17 @@ local function peerHolder(userId)
 	return holderFor(character), peer
 end
 
-local function peerStep()
-	for userId, peer in pairs(peers) do
-		if peer.equipped then
-			local holder = peerHolder(userId)
-			if holder then
-				holder.equipped = true
-				if not holder.motor then
-					holder.rounds = peer.rounds
-					attach(holder)
-				end
-			end
-		end
-	end
-end
-
-local rounds = ammo
-local equipped = false
-local lastShot = 0
-local shotCounter = 0
-local published = nil
-local sinceSend = 0
-local shootButton, clearButton
-
 local function onControl(text)
 	local ok, message = pcall(HttpService.JSONDecode, HttpService, text)
 	if not (ok and type(message) == "table") then
 		return
 	end
-
 	if message.t == "welcome" then
 		connected = true
 		setStatus("bridged  ." .. CONFIG.ROOM, Color3.fromRGB(120, 235, 140))
-		send("e" .. (equipped and 1 or 0))
-		send("m" .. rounds)
+		log("welcome, peers:", message.peers and #message.peers or 0)
+		-- tell whoever is already in the room where we stand
+		send("e" .. (holders[LP.Character] and holders[LP.Character].equipped and 1 or 0))
 	elseif message.t == "leave" and message.uid then
 		dropPeer(message.uid)
 	elseif message.t == "error" then
@@ -923,108 +1170,86 @@ local function onControl(text)
 	end
 end
 
-local function onAim(userId)
-	local holder = peerHolder(userId)
-	if holder then
-		holder.wantPitch = fields[2] / 10000
-		holder.wantYaw = fields[3] / 10000
-		holder.wantBlend = fields[4] / 255
-		holder.pointAt = os.clock()
-	end
-end
-
-local function onEquipped(userId)
-	local holder, peer = peerHolder(userId)
-	local on = fields[2] == 1
-	peer.equipped = on
-	if not holder then
-		return
-	end
-	holder.equipped = on
-	if on then
-		attach(holder)
-	else
-		detach(holder)
-		holder.wantBlend = 0
-	end
-end
-
-local function onAmmo(userId)
-	local holder, peer = peerHolder(userId)
-	peer.rounds = fields[2]
-	if holder then
-		holder.rounds = fields[2]
-		if holder.count then
-			holder.count.Text = tostring(fields[2])
-		end
-	end
-end
-
-local function onShot(userId, count)
-	if count < 9 then
-		return
-	end
-	local n = fields[2]
-	local muzzle = Vector3.new(fields[3] / 100, fields[4] / 100, fields[5] / 100)
-	local landing = Vector3.new(fields[6] / 100, fields[7] / 100, fields[8] / 100)
-	local hit = fields[9] == 1
-	local normal = hit
-			and count >= 12
-			and Vector3.new(fields[10] / 1000, fields[11] / 1000, fields[12] / 1000)
-		or Vector3.yAxis
-
-	shootFluid(muzzle, landing, function()
-		arrive(userId, n, hit, landing + normal * 0.1, normal)
-	end)
-end
-
-local function onTravel(count)
-	if count < 4 then
-		return
-	end
-	local owner = fields[2]
-	local from = portals[owner .. ":" .. fields[3]]
-	local to = portals[owner .. ":" .. fields[4]]
-	if from then
-		playAt(from.plate.Position, "Enter")
-	end
-	if to then
-		playAt(to.plate.Position, "Enter")
-	end
-end
-
 onFrame = function(text)
 	if type(text) ~= "string" or #text < 2 then
 		return
 	end
-
 	local kind = string.byte(text, 1)
-	if kind == 123 then
+
+	if kind == 123 then -- '{' : the control channel is the only JSON on the wire
 		return onControl(text)
 	end
 
-	local count = split(text, 2)
+	local n = split(text, 2)
 	local userId = fields[1]
 	if not userId or userId == LP.UserId then
-		return
+		return -- the relay does not echo, but never trust that
 	end
 
-	if kind == 97 then
-		if count >= 4 then
-			onAim(userId)
+	if kind == 97 then -- 'a' aim
+		if n < 4 then
+			return
 		end
-	elseif kind == 101 then
-		onEquipped(userId)
-	elseif kind == 109 then
-		onAmmo(userId)
-	elseif kind == 115 then
-		onShot(userId, count)
-	elseif kind == 99 then
+		local holder = peerHolder(userId)
+		if holder then
+			holder.wantPitch = fields[2] / 10000
+			holder.wantYaw = fields[3] / 10000
+			holder.wantBlend = fields[4] / 255
+			holder.pointAt = os.clock()
+		end
+	elseif kind == 101 then -- 'e' equipped
+		local holder, peer = peerHolder(userId)
+		local on = fields[2] == 1
+		peer.equipped = on
+		if holder then
+			holder.equipped = on
+			if on then
+				attach(holder)
+			else
+				detach(holder)
+				holder.wantBlend = 0
+			end
+		end
+	elseif kind == 109 then -- 'm' ammo
+		local holder, peer = peerHolder(userId)
+		peer.ammo = fields[2]
+		if holder then
+			holder.ammo = fields[2]
+			if holder.count then
+				holder.count.Text = tostring(fields[2])
+			end
+		end
+
+	elseif kind == 115 then -- 's' shot: the shooter already decided the outcome,
+		if n < 9 then      -- so this replays it rather than raycasting again and
+			return         -- risking a different answer on each machine
+		end
+		local portalN = fields[2]
+		local muzzle = Vector3.new(fields[3] / 100, fields[4] / 100, fields[5] / 100)
+		local landing = Vector3.new(fields[6] / 100, fields[7] / 100, fields[8] / 100)
+		local hit = fields[9] == 1
+		local normal = hit and n >= 12 and Vector3.new(fields[10] / 1000, fields[11] / 1000, fields[12] / 1000)
+			or Vector3.yAxis
+		shootFluid(muzzle, landing, function()
+			arrive(userId, portalN, hit, landing + normal * SURFACE_OFFSET, normal)
+		end)
+	elseif kind == 99 then -- 'c' close one
 		closePortal(userId .. ":" .. fields[2])
-	elseif kind == 120 then
+	elseif kind == 120 then -- 'x' clear every portal, both ends of the bridge
 		clearPortals(false)
-	elseif kind == 116 then
-		onTravel(count)
+	elseif kind == 116 then -- 't' travel: the traveller moved itself, and its own
+		if n < 4 then       -- CFrame write replicates, so this is only the sound
+			return           -- at both ends
+		end
+		local owner = fields[2]
+		local from = portals[owner .. ":" .. fields[3]]
+		local to = portals[owner .. ":" .. fields[4]]
+		if from then
+			playAt(from.plate.Position, "Enter")
+		end
+		if to then
+			playAt(to.plate.Position, "Enter")
+		end
 	end
 end
 
@@ -1034,10 +1259,12 @@ local function pump(sock)
 	end)
 	if ok and signal then
 		keep(signal:Connect(function(text)
-			pcall(onFrame, text)
+			local fine, err = pcall(onFrame, text)
+			if not fine then
+				log("frame error:", err)
+			end
 		end))
 	end
-
 	local shut
 	ok, shut = pcall(function()
 		return sock.OnClose or sock.onClose
@@ -1059,7 +1286,8 @@ task.spawn(function()
 			if sock then
 				socket = sock
 				pump(sock)
-				socketSend(sock, handshake())
+				socketSend(sock, handshake()) -- the relay answers with `welcome`
+				                              -- or `error`, which sets `connected`
 			else
 				setStatus("no WebSocket in this executor", Color3.fromRGB(240, 120, 120))
 			end
@@ -1067,6 +1295,17 @@ task.spawn(function()
 		task.wait(CONFIG.RECONNECT)
 	end
 end)
+
+--=========================================================================
+-- the local player: the Tool, the aim, the trigger
+--=========================================================================
+
+local ammo = START_AMMO
+local lastShot = 0
+local shotCounter = 0
+local equipped = false
+local sinceSend = 0
+local published = nil
 
 local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -1076,32 +1315,28 @@ local shotParams = RaycastParams.new()
 shotParams.FilterType = Enum.RaycastFilterType.Exclude
 shotParams.IgnoreWater = true
 
-local function setAmmo(value)
-	rounds = clamp(value, 0, ammo)
+local shootButton -- built by the HUD, dimmed when the gun runs dry
+local clearButton
 
+local function setAmmo(value)
+	ammo = math.clamp(value, 0, START_AMMO)
 	local holder = LP.Character and holders[LP.Character]
 	if holder then
-		holder.rounds = rounds
+		holder.ammo = ammo
 		if holder.count then
-			holder.count.Text = tostring(rounds)
+			holder.count.Text = tostring(ammo)
 		end
 	end
-
-	send("m" .. rounds)
-
+	send("m" .. ammo)
 	if shootButton then
-		shootButton.BackgroundTransparency = rounds <= 0 and 0.6 or 0.15
-		shootButton.TextTransparency = rounds <= 0 and 0.55 or 0
+		shootButton.BackgroundTransparency = ammo <= 0 and 0.6 or 0.15
+		shootButton.TextTransparency = ammo <= 0 and 0.55 or 0
 	end
 end
 
-local function cursorPoint(camera)
-	if UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter or not UserInputService.MouseEnabled then
-		return camera.ViewportSize * 0.5
-	end
-	return UserInputService:GetMouseLocation()
-end
-
+-- Studio streamed the cursor point to the server and let it work out the angles.
+-- Here the owner does both, then sends the finished angles instead of the point -
+-- one frame rather than a round trip, and the peer has nothing to recompute.
 local function senderStep()
 	local character = LP.Character
 	if not character then
@@ -1114,45 +1349,44 @@ local function senderStep()
 
 	local camera = workspace.CurrentCamera
 	if equipped and camera then
-		local cursor = cursorPoint(camera)
+		-- With the gun out the mouse may be held in the middle of the screen, and a
+		-- touchscreen has no cursor at all, so the aim comes from the middle of the
+		-- viewport - the same spot the crosshair is drawn on.
+		local cursor
+		if UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter or not UserInputService.MouseEnabled then
+			cursor = camera.ViewportSize * 0.5
+		else
+			cursor = UserInputService:GetMouseLocation() -- excludes the topbar inset,
+			                                            -- as ViewportPointToRay does
+		end
 		local ray = camera:ViewportPointToRay(cursor.X, cursor.Y)
 		rayParams.FilterDescendantsInstances = { character, folder }
-		local hit = workspace:Raycast(ray.Origin, ray.Direction * 2000, rayParams)
-		holder.point = hit and hit.Position or ray.Origin + ray.Direction * 2000
+		local hit = workspace:Raycast(ray.Origin, ray.Direction * AIM_RANGE, rayParams)
+		holder.point = hit and hit.Position or ray.Origin + ray.Direction * AIM_RANGE
 		holder.pointAt = os.clock()
 	end
 
 	local wantPitch, wantYaw, wantBlend = 0, 0, 0
-	if equipped and holder.point and os.clock() - holder.pointAt <= 0.4 then
+	if equipped and holder.point and os.clock() - holder.pointAt <= STALE_AFTER then
 		local torsoCF = holder.rig.torso.CFrame
 		local offset = holder.point - armAnchor(holder.rig, torsoCF)
 		if offset.Magnitude > 0.5 then
 			local direction = torsoCF:VectorToObjectSpace(offset.Unit)
-			local limit = rad(75)
+			-- +pitch is up, +yaw is toward the character's left; the torso's +X is
+			-- its right and its +Z is backwards
 			wantYaw = clampYaw(atan2(-direction.X, -direction.Z), holder.yaw)
-			wantPitch = clamp(asin(clamp(direction.Y, -1, 1)), -limit, limit)
+			wantPitch = clamp(asin(clamp(direction.Y, -1, 1)), -MAX_PITCH, MAX_PITCH)
 			wantBlend = 1
 		end
 	end
 	holder.wantPitch, holder.wantYaw, holder.wantBlend = wantPitch, wantYaw, wantBlend
 
+	-- a parked cursor sends nothing: below ~0.23 degrees it is not worth the frame
 	local target = Vector3.new(wantPitch, wantYaw, wantBlend)
-	if not published or (published - target).Magnitude > 0.004 then
+	if not published or (published - target).Magnitude > PUBLISH_EPSILON then
 		published = target
 		send("a" .. q(wantPitch, 10000) .. "," .. q(wantYaw, 10000) .. "," .. q(wantBlend, 255))
 	end
-end
-
-local function resolveShot(character, muzzle, direction)
-	shotParams.FilterDescendantsInstances = { character, folder }
-	local hit = workspace:Raycast(muzzle, direction * 300, shotParams)
-	if hit then
-		local model = hit.Instance:FindFirstAncestorOfClass("Model")
-		if model and model:FindFirstChildOfClass("Humanoid") then
-			return nil
-		end
-	end
-	return hit
 end
 
 local function fire()
@@ -1161,20 +1395,19 @@ local function fire()
 	if not (equipped and holder) then
 		return
 	end
-
 	local now = os.clock()
-	if lastShot + 0.35 > now or rounds <= 0 then
+	if lastShot + SHOT_COOLDOWN > now or ammo <= 0 then
 		return
 	end
-	if not (holder.point and now - holder.pointAt <= 0.4) then
-		return
+	if not (holder.point and now - holder.pointAt <= STALE_AFTER) then
+		return -- no fresh idea of where they are pointing
 	end
-
 	local barrel = holder.barrel
 	if not (barrel and barrel.Parent) then
 		return
 	end
 
+	-- the gun's +X is the muzzle; see GRIP_ROT
 	local muzzle = (barrel.CFrame * CFrame.new(barrel.Size.X * 0.5 + 0.2, 0, 0)).Position
 	local offset = holder.point - muzzle
 	if offset.Magnitude < 1 then
@@ -1182,14 +1415,23 @@ local function fire()
 	end
 
 	lastShot = now
-	setAmmo(rounds - 1)
+	setAmmo(ammo - 1) -- the spend is unconditional: a shot into the sky costs a
+	                  -- round, which is the intended feel for a fluid
 
-	local hit = resolveShot(character, muzzle, offset.Unit)
-	local landing = hit and hit.Position or muzzle + offset.Unit * 300
-	local normal = hit and hit.Normal or Vector3.yAxis
+	shotParams.FilterDescendantsInstances = { character, folder }
+	local hit = workspace:Raycast(muzzle, offset.Unit * RANGE, shotParams)
+	if hit then
+		-- a portal needs a surface that stays put, not somebody's leg
+		local model = hit.Instance:FindFirstAncestorOfClass("Model")
+		if model and model:FindFirstChildOfClass("Humanoid") then
+			hit = nil
+		end
+	end
 
 	shotCounter += 1
 	local n = shotCounter
+	local landing = hit and hit.Position or muzzle + offset.Unit * RANGE
+	local normal = hit and hit.Normal or Vector3.yAxis
 
 	local frame = "s" .. n .. "," .. packV3(muzzle) .. "," .. packV3(landing) .. "," .. (hit and 1 or 0)
 	if hit then
@@ -1198,9 +1440,15 @@ local function fire()
 	send(frame)
 
 	shootFluid(muzzle, landing, function()
-		arrive(LP.UserId, n, hit ~= nil, landing + normal * 0.1, normal)
+		-- the 0.1 stud offset is why a shot at the crosshair measures 0.10 studs
+		-- from the point under it: the plate floats deliberately that far off
+		arrive(LP.UserId, n, hit ~= nil, landing + normal * SURFACE_OFFSET, normal)
 	end)
 end
+
+--=========================================================================
+-- the Tool
+--=========================================================================
 
 local tool = nil
 
@@ -1215,6 +1463,8 @@ local function buildTool()
 
 	tool = keep(Instance.new("Tool"))
 	tool.Name = "PortalGun"
+	-- no Handle at all: give a Tool one and the engine builds its own RightGrip
+	-- weld on equip, and two joints owning the same part make the gun jitter
 	tool.RequiresHandle = false
 	tool.CanBeDropped = false
 	tool.ToolTip = "Golden Portal Gun"
@@ -1222,25 +1472,25 @@ local function buildTool()
 
 	hook(tool.Equipped, function()
 		equipped = true
-		published = nil
 		local holder = LP.Character and holderFor(LP.Character)
 		if holder then
 			holder.equipped = true
 			attach(holder)
 		end
+		published = nil
 		send("e1")
-		setAmmo(rounds)
+		setAmmo(ammo)
 	end)
 
 	hook(tool.Unequipped, function()
 		equipped = false
-		published = nil
 		local holder = LP.Character and holders[LP.Character]
 		if holder then
 			holder.equipped = false
 			holder.wantBlend = 0
 			detach(holder)
 		end
+		published = nil
 		send("e0")
 	end)
 
@@ -1248,122 +1498,119 @@ local function buildTool()
 	tool.Parent = backpack
 end
 
+--=========================================================================
+-- HUD: the crosshair, the connection line, and a trigger for touchscreens
+--=========================================================================
+
 local TOUCH_CAPABLE = UserInputService.TouchEnabled
 local usingTouch = TOUCH_CAPABLE and not UserInputService.MouseEnabled
 local hud, cursorFrame
-local iconHidden = false
-
-local function buildStatusLabel(parent)
-	local label = Instance.new("TextLabel")
-	label.Name = "Status"
-	label.Position = UDim2.fromOffset(12, 12)
-	label.Size = UDim2.fromOffset(320, 18)
-	label.BackgroundTransparency = 1
-	label.Font = Enum.Font.Code
-	label.TextSize = 14
-	label.TextXAlignment = Enum.TextXAlignment.Left
-	label.TextStrokeTransparency = 0.4
-	label.Text = ""
-	label.Parent = parent
-	return label
-end
-
-local function buildCursor(parent)
-	local image = Instance.new("ImageLabel")
-	image.Name = "Cursor"
-	image.Image = "rbxassetid://187012669"
-	image.Size = UDim2.fromOffset(10, 10)
-	image.AnchorPoint = Vector2.new(0.5, 0.5)
-	image.BackgroundTransparency = 1
-	image.ScaleType = Enum.ScaleType.Stretch
-	image.ZIndex = 5
-	image.Visible = false
-	image.Parent = parent
-	return image
-end
-
-local function buildCircle(parent, name, label, row, side, onClick)
-	local idle = Color3.fromRGB(222, 222, 222)
-
-	local button = Instance.new("TextButton")
-	button.Name = name
-	button.AnchorPoint = Vector2.new(1, 1)
-	button.Position = UDim2.new(1, -24, 1, -floor(side * 1.35 + 24 + row * (side + 14)))
-	button.Size = UDim2.fromOffset(side, side)
-	button.BackgroundColor3 = idle
-	button.BackgroundTransparency = 0.15
-	button.AutoButtonColor = false
-	button.Text = label
-	button.TextColor3 = Color3.fromRGB(25, 25, 25)
-	button.Font = Enum.Font.GothamBold
-	button.TextSize = floor(side * 0.22)
-	button.Visible = false
-	button.Parent = parent
-
-	local corner = Instance.new("UICorner")
-	corner.CornerRadius = UDim.new(1, 0)
-	corner.Parent = button
-
-	local function unpress()
-		button.BackgroundColor3 = idle
-	end
-
-	hook(button.MouseButton1Down, function()
-		button.BackgroundColor3 = Color3.fromRGB(255, 221, 51)
-	end)
-	hook(button.MouseButton1Up, unpress)
-	hook(button.MouseLeave, unpress)
-	hook(button.MouseButton1Click, onClick)
-	return button
-end
 
 local function buildHud()
 	local old = LP.PlayerGui:FindFirstChild("PortalBridgeHud")
 	if old then
 		old:Destroy()
 	end
-
 	hud = keep(Instance.new("ScreenGui"))
 	hud.Name = "PortalBridgeHud"
 	hud.ResetOnSpawn = false
 	hud.DisplayOrder = 5
 	hud.IgnoreGuiInset = false
 	pcall(function()
+		-- a notch or a home bar pushes the button in rather than sitting on it
 		hud.ScreenInsets = Enum.ScreenInsets.DeviceSafeInsets
 	end)
 	hud.Parent = LP.PlayerGui
 
-	statusLabel = buildStatusLabel(hud)
-	cursorFrame = buildCursor(hud)
+	statusLabel = Instance.new("TextLabel")
+	statusLabel.Name = "Status"
+	statusLabel.AnchorPoint = Vector2.new(0, 0)
+	statusLabel.Position = UDim2.fromOffset(12, 12)
+	statusLabel.Size = UDim2.fromOffset(320, 18)
+	statusLabel.BackgroundTransparency = 1
+	statusLabel.Font = Enum.Font.Code
+	statusLabel.TextSize = 14
+	statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+	statusLabel.TextStrokeTransparency = 0.4
+	statusLabel.Text = ""
+	statusLabel.Parent = hud
 
-	if not TOUCH_CAPABLE then
-		return
+	-- the crosshair, since StarterGui.Cursor is a place asset the executor has not
+	-- got. On a mouse it follows the pointer; on a touchscreen it pins to the
+	-- middle, which is where the aim comes from there.
+	cursorFrame = Instance.new("ImageLabel")
+	cursorFrame.Name = "Cursor"
+	cursorFrame.Image = IMAGE_CURSOR
+	cursorFrame.Size = UDim2.fromOffset(10, 10)
+	cursorFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+	cursorFrame.BackgroundTransparency = 1
+	cursorFrame.ScaleType = Enum.ScaleType.Stretch
+	cursorFrame.ZIndex = 5
+	cursorFrame.Visible = false
+	cursorFrame.Parent = hud
+
+	if TOUCH_CAPABLE then
+		local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1024, 768)
+		local side = clamp(math.min(viewport.X, viewport.Y) * 0.18, 84, 150)
+		local IDLE = Color3.fromRGB(222, 222, 222)
+
+		-- One shape for both controls, stacked up the right edge. The very corner
+		-- belongs to Roblox's jump button, hence the first lift.
+		local function circle(name, label, row, onClick)
+			local button = Instance.new("TextButton")
+			button.Name = name
+			button.AnchorPoint = Vector2.new(1, 1)
+			button.Position = UDim2.new(1, -24, 1, -floor(side * 1.35 + 24 + row * (side + 14)))
+			button.Size = UDim2.fromOffset(side, side)
+			button.BackgroundColor3 = IDLE
+			button.BackgroundTransparency = 0.15
+			button.AutoButtonColor = false -- the flash is the only colour change
+			button.Text = label
+			button.TextColor3 = Color3.fromRGB(25, 25, 25)
+			button.Font = Enum.Font.GothamBold
+			button.TextSize = floor(side * 0.22)
+			button.Visible = false
+			button.Parent = hud
+
+			local corner = Instance.new("UICorner")
+			corner.CornerRadius = UDim.new(1, 0)
+			corner.Parent = button
+
+			hook(button.MouseButton1Down, function()
+				button.BackgroundColor3 = BUTTON_YELLOW
+			end)
+			local function unpress()
+				button.BackgroundColor3 = IDLE
+			end
+			hook(button.MouseButton1Up, unpress)
+			hook(button.MouseLeave, unpress)
+			hook(button.MouseButton1Click, onClick)
+			return button
+		end
+
+		shootButton = circle("Shoot", "SHOOT", 0, fire) -- the same path a click pulls
+		clearButton = circle("Clear", "CLEAR", 1, function()
+			clearPortals(true)
+		end)
 	end
-
-	local camera = workspace.CurrentCamera
-	local viewport = camera and camera.ViewportSize or Vector2.new(1024, 768)
-	local side = clamp(min(viewport.X, viewport.Y) * 0.18, 84, 150)
-
-	shootButton = buildCircle(hud, "Shoot", "SHOOT", 0, side, fire)
-	clearButton = buildCircle(hud, "Clear", "CLEAR", 1, side, function()
-		clearPortals(true)
-	end)
 end
+
+local iconHidden = false
 
 local function hudStep()
 	if not cursorFrame then
 		return
 	end
-
-	local onTouch = equipped and usingTouch
 	cursorFrame.Visible = equipped
+	local onTouch = equipped and usingTouch
 	if shootButton then
 		shootButton.Visible = onTouch
 	end
 	if clearButton then
 		clearButton.Visible = onTouch
 	end
-
+	-- the system cursor goes only while our own crosshair is up, so an unequipped
+	-- player is not left with no pointer at all
 	if equipped ~= iconHidden then
 		iconHidden = equipped
 		UserInputService.MouseIconEnabled = not equipped
@@ -1371,10 +1618,10 @@ local function hudStep()
 	if not equipped then
 		return
 	end
-
 	if usingTouch or UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter then
 		local camera = workspace.CurrentCamera
 		if camera then
+			-- this ScreenGui's canvas starts below the topbar, so the inset comes off
 			local middle = camera.ViewportSize * 0.5 - GuiService:GetGuiInset()
 			cursorFrame.Position = UDim2.fromOffset(middle.X, middle.Y)
 		end
@@ -1384,18 +1631,13 @@ local function hudStep()
 	end
 end
 
+-- A tablet with a keyboard case reports a keyboard and a mouse as well as touch,
+-- and so does Studio's emulator, so `TouchEnabled and not KeyboardEnabled` never
+-- fires. Whichever the player last used wins instead.
 local function isTouch(inputType)
 	return inputType == Enum.UserInputType.Touch
 		or inputType == Enum.UserInputType.Gyro
 		or inputType == Enum.UserInputType.Accelerometer
-end
-
-local function isPointer(inputType)
-	return inputType == Enum.UserInputType.MouseMovement
-		or inputType == Enum.UserInputType.MouseButton1
-		or inputType == Enum.UserInputType.MouseButton2
-		or inputType == Enum.UserInputType.MouseWheel
-		or inputType == Enum.UserInputType.Keyboard
 end
 
 if TOUCH_CAPABLE then
@@ -1405,31 +1647,45 @@ if TOUCH_CAPABLE then
 	hook(UserInputService.LastInputTypeChanged, function(inputType)
 		if isTouch(inputType) then
 			usingTouch = true
-		elseif isPointer(inputType) then
+		elseif
+			inputType == Enum.UserInputType.MouseMovement
+			or inputType == Enum.UserInputType.MouseButton1
+			or inputType == Enum.UserInputType.MouseButton2
+			or inputType == Enum.UserInputType.MouseWheel
+			or inputType == Enum.UserInputType.Keyboard
+		then
 			usingTouch = false
 		end
 	end)
 end
 
+-- T clears both ends of the bridge, since portals no longer time out. Checking
+-- gameProcessed is what keeps it from firing while the chat bar has the keyboard.
 hook(UserInputService.InputBegan, function(input, processed)
-	if not processed and alive and input.KeyCode == key then
+	if processed or not alive then
+		return
+	end
+	if input.KeyCode == CLEAR_KEY then
 		clearPortals(true)
 	end
 end)
 
+--=========================================================================
+-- lives
+--=========================================================================
+
 local function onCharacter(character)
 	equipped = false
 	published = nil
-	rounds = ammo
-
+	ammo = START_AMMO -- a fresh life, a full gun
+	-- the Backpack is rebuilt on respawn, so the Tool has to be too
 	task.defer(function()
 		if alive then
 			buildTool()
-			setAmmo(rounds)
+			setAmmo(ammo)
 			send("e0")
 		end
 	end)
-
 	character.AncestryChanged:Once(function()
 		local holder = holders[character]
 		if holder then
@@ -1448,9 +1704,17 @@ hook(Players.PlayerRemoving, function(player)
 	dropPeer(player.UserId)
 end)
 
+--=========================================================================
+-- the loops
+--=========================================================================
+
 local sendInterval = 1 / clamp(CONFIG.SEND_RATE, 5, 60)
 local sincePeers = 0
 
+-- PreSimulation: after the Animator has evaluated this frame, before physics
+-- moves anything. Everything that writes a joint has to be here - on
+-- PostSimulation the next frame's animation overwrites the write.
+-- PreSimulation passes (dt); the older Stepped passes (time, dt).
 local okPre, preSignal = pcall(function()
 	return RunService.PreSimulation
 end)
@@ -1462,7 +1726,6 @@ hook(stepSignal, function(a, b)
 	if not alive then
 		return
 	end
-
 	local dt = (stepIsPre and a or b) or 1 / 60
 	sinceSend += dt
 	if sinceSend >= sendInterval then
@@ -1472,11 +1735,29 @@ hook(stepSignal, function(a, b)
 	poseStep(dt)
 end)
 
+-- A peer's `e1` can land before its character exists on this machine, and its
+-- character is rebuilt on every respawn, so the gun is re-checked rather than
+-- attached once and hoped for.
+local function peerStep()
+	for userId, peer in pairs(peers) do
+		if peer.equipped then
+			local holder = peerHolder(userId)
+			if holder then
+				holder.equipped = true
+				if not holder.motor then
+					holder.ammo = peer.ammo
+					attach(holder)
+				end
+			end
+		end
+	end
+end
+
+-- travel is a physics answer, so it reads the world after physics has moved it
 hook(RunService.Heartbeat, function(dt)
 	if not alive then
 		return
 	end
-
 	travelStep()
 	sincePeers += dt
 	if sincePeers >= 0.1 then
@@ -1493,33 +1774,9 @@ hook(RunService.RenderStepped, function(dt)
 	hudStep()
 end)
 
-local function closeSocket()
-	if not socket then
-		return
-	end
-	pcall(function()
-		if socket.Close then
-			socket:Close()
-		elseif socket.close then
-			socket:close()
-		end
-	end)
-	socket = nil
-end
-
-local function emptyBin()
-	for index = #bin, 1, -1 do
-		local item = bin[index]
-		bin[index] = nil
-		pcall(function()
-			if typeof(item) == "RBXScriptConnection" then
-				item:Disconnect()
-			else
-				item:Destroy()
-			end
-		end)
-	end
-end
+--=========================================================================
+-- teardown
+--=========================================================================
 
 function Bridge.stop()
 	if not alive then
@@ -1531,7 +1788,8 @@ function Bridge.stop()
 		pcall(detach, holder)
 		holders[character] = nil
 	end
-	for id, record in pairs(portals) do
+	for id in pairs(portals) do
+		local record = portals[id]
 		portals[id] = nil
 		pcall(function()
 			record.model:Destroy()
@@ -1540,24 +1798,58 @@ function Bridge.stop()
 	table.clear(pair.ids)
 	table.clear(peers)
 
-	closeSocket()
+	if socket then
+		pcall(function()
+			if socket.Close then
+				socket:Close()
+			elseif socket.close then
+				socket:close()
+			end
+		end)
+		socket = nil
+	end
 	connected = false
-	emptyBin()
+
+	for i = #bin, 1, -1 do
+		local item = bin[i]
+		bin[i] = nil
+		pcall(function()
+			if typeof(item) == "RBXScriptConnection" then
+				item:Disconnect()
+			else
+				item:Destroy()
+			end
+		end)
+	end
 
 	UserInputService.MouseIconEnabled = true
 	statusLabel, shootButton, clearButton, cursorFrame, hud, tool = nil, nil, nil, nil, nil, nil
+	print("[PortalBridge] stopped")
 end
 
-function Bridge.clear()
-	clearPortals(true)
-end
+
 
 buildHud()
 setStatus("dialling " .. CONFIG.HOST .. " ...", Color3.fromRGB(240, 190, 110))
 
-print(("REAADY NAXYI %s (%d), EZ %q. %s EZ EZ."):format(
+Bridge.fire = fire
+Bridge.clear = function()
+	clearPortals(true)
+end
+Bridge.status = function()
+	return {
+		connected = connected,
+		room = CONFIG.ROOM,
+		ammo = ammo,
+		portals = portals,
+		pair = pair.ids,
+		peers = peers,
+	}
+end
+
+print(("[PortalBridge] up as %s (%d) - %s rig, room %q. T clears portals, PortalBridge.stop() unloads."):format(
 	LP.Name,
 	LP.UserId,
-	CONFIG.ROOM,
-	key.Name
+	(LP.Character and rigOf(LP.Character) and rigOf(LP.Character).kind) or "no rig yet",
+	CONFIG.ROOM
 ))
