@@ -511,11 +511,25 @@ end
 -- same result by a different road, and the reason both guns are built locally.
 local function attach(holder)
 	local rig = holder.rig
-	if not rig or holder.motor then
+	if not rig or holder.motor or holder.attaching then
+		return
+	end
+	-- buildGun yields (AssetService:CreateMeshPartAsync), and peerStep runs every
+	-- 0.1 s: without this flag it would call in again while the first build was
+	-- still in the air and leave a stack of orphaned guns on the character.
+	holder.attaching = true
+	local built, gun, count = pcall(buildGun)
+	holder.attaching = false
+	if not built or not gun then
 		return
 	end
 
-	local gun, count = buildGun()
+	-- the world may have moved on across that yield
+	if holder.motor or not (rig.hand and rig.hand.Parent and holder.character.Parent) then
+		gun:Destroy()
+		return
+	end
+
 	local grip = gripFor(rig)
 	gun.Parent = holder.character -- a sibling of the limbs, not under the Tool
 	gun:PivotTo(rig.hand.CFrame * grip) -- in place before it is jointed, or it
@@ -694,6 +708,10 @@ local function closePortal(id)
 	record.closing = true
 	portals[id] = nil
 	forgetId(id) -- or a dead id would count towards the pair and trim a live one
+	if not record.revealed then
+		record.model:Destroy() -- claimed a slot but never became visible
+		return
+	end
 	playAt(record.plate.Position, "Close")
 	TweenService:Create(
 		record.image,
@@ -706,7 +724,7 @@ local function closePortal(id)
 	end)
 end
 
-local function openPortal(owner, n, position, normal)
+local function createPortal(owner, n, position, normal)
 	local id = owner .. ":" .. n
 	if portals[id] then
 		return
@@ -759,14 +777,6 @@ local function openPortal(owner, n, position, normal)
 
 	model.Parent = folder
 
-	TweenService:Create(
-		image,
-		TweenInfo.new(OPEN_TIME, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
-		{ Size = UDim2.fromScale(1, 1) }
-	):Play()
-	TweenService:Create(light, TweenInfo.new(OPEN_TIME), { Brightness = GLOW, Range = PORTAL_LIGHT_RANGE }):Play()
-	playAt(position, "Open")
-
 	local record = {
 		id = id,
 		n = n,
@@ -775,7 +785,8 @@ local function openPortal(owner, n, position, normal)
 		plate = plate,
 		image = image,
 		light = light,
-		open = false,
+		open = false, -- travel and the visual pulse both wait for this
+		revealed = false, -- the slot is claimed; the fluid has not landed yet
 		bornAt = os.clock(),
 		-- kept so this portal can be re-announced to a peer that reconnects or
 		-- joins late; without it a churned connection loses the pair for good
@@ -783,14 +794,43 @@ local function openPortal(owner, n, position, normal)
 		normal = normal,
 	}
 	portals[id] = record
+	return record
+end
+
+-- The slot is claimed the moment the frame arrives; the portal only becomes
+-- VISIBLE when the fluid lands. Splitting those two is what makes trimming
+-- deterministic - both machines claim slots in the relay's order, however long
+-- each one's glob happens to be in the air.
+local function revealPortal(record, instant)
+	if not record or record.closing or record.revealed then
+		return
+	end
+	record.revealed = true
+	if instant then
+		-- a re-announce: this portal has been standing on the peer's screen for a
+		-- while already, so it must not replay its own opening
+		record.image.Size = UDim2.fromScale(1, 1)
+		record.light.Brightness = GLOW
+		record.light.Range = PORTAL_LIGHT_RANGE
+		record.open = true
+		return
+	end
+	TweenService:Create(
+		record.image,
+		TweenInfo.new(OPEN_TIME, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+		{ Size = UDim2.fromScale(1, 1) }
+	):Play()
+	TweenService:Create(
+		record.light,
+		TweenInfo.new(OPEN_TIME),
+		{ Brightness = GLOW, Range = PORTAL_LIGHT_RANGE }
+	):Play()
+	playAt(record.position, "Open")
 	task.delay(OPEN_TIME, function()
 		if not record.closing then
-			record.open = true -- the visual pulse may start, and travel may fire
+			record.open = true
 		end
 	end)
-
-	table.insert(pair.ids, id)
-	return record
 end
 
 -- the glob of fluid, on its way to where the portal will open. Pure decoration:
@@ -841,23 +881,27 @@ local function shootFluid(origin, landing, onArrival)
 	end)
 end
 
--- Both machines run this off the same `s` frame, so they open the same portal in
--- the same place with the same id. Portals no longer expire on a clock - they
--- stand until the third one pushes the oldest out, or until somebody clears.
-local function arrive(owner, n, hit, position, normal)
-	if not hit then
-		return -- nothing solid out there: the fluid just goes
+-- shot number -> when it was fired and how long its glob flies, so the relay's
+-- stamped copy coming back can reveal the portal at the right moment
+local pendingShots = {}
+
+-- Claim a slot in the shared pair. Called the instant a stamped `s` or `p` frame
+-- arrives - on BOTH machines, in the relay's order - so the trim decision is the
+-- same on each. The portal is invisible until revealPortal.
+local function reserve(owner, n, position, normal)
+	local record = createPortal(owner, n, position, normal)
+	if not record then
+		return nil -- already have this one
 	end
-	if not openPortal(owner, n, position, normal) then
-		return
-	end
+	table.insert(pair.ids, record.id)
 	while #pair.ids > 2 do
 		closePortal(pair.ids[1]) -- the oldest gives way; closePortal un-lists it
 	end
+	return portals[record.id] and record or nil
 end
 
--- The other open portal, whoever shot it. This is the change that lets one player
--- drop one end and the other player the other.
+-- The other open portal, whoever shot it. This is what lets one player drop one
+-- end and the other player the other.
 local function partner(record)
 	for _, id in ipairs(pair.ids) do
 		local other = portals[id]
@@ -866,6 +910,15 @@ local function partner(record)
 		end
 	end
 	return nil
+end
+
+local function forgetOwner(userId)
+	for index = #pair.ids, 1, -1 do
+		local record = portals[pair.ids[index]]
+		if record and record.owner == userId then
+			closePortal(record.id)
+		end
+	end
 end
 
 local function clearPortals(announce)
@@ -878,10 +931,12 @@ local function clearPortals(announce)
 	end
 end
 
--- Re-declare every portal this machine owns. Sent on `welcome` and whenever a
--- peer joins, so a reconnect - which used to wipe the pair permanently - now
--- heals itself within a frame or two.
+-- Re-declare every portal this machine owns. `f` first, so the peer drops what it
+-- thinks it knows: a re-executed script restarts its shot counter at 1, and the
+-- peer's leftover "me:1" would silently swallow the new one - which is exactly
+-- what made replication look random.
 local function announcePortals()
+	send("f")
 	for _, id in ipairs(pair.ids) do
 		local record = portals[id]
 		if record and record.owner == LP.UserId and not record.closing then
@@ -1027,7 +1082,7 @@ end
 local function visualStep(dt)
 	local clock = os.clock()
 	for _, record in pairs(portals) do
-		if not record.closing then
+		if record.revealed and not record.closing then
 			record.image.Rotation = (record.image.Rotation + SPIN_SPEED * dt) % 360
 			if record.open then
 				record.light.Brightness = GLOW * (1 + PULSE * math.sin(clock * PULSE_RATE))
@@ -1046,14 +1101,21 @@ end
 -- times the bytes for no gain. One letter of kind, then integers.
 --   client -> relay   a<p>,<y>,<b>                       aim
 --                     s<n>,<mx,my,mz>,<lx,ly,lz>,<h>[,<nx,ny,nz>]   shot
+--                     p<n>,<px,py,pz>,<nx,ny,nz>         a portal that exists
 --                     c<id>                              close one
 --                     x                                  clear every portal
+--                     f                                  drop all mine, a resync
 --                     t<owner>,<fromN>,<toN>             travel
 --                     m<ammo>                            ammo
 --                     e<0|1>                             equipped
+--                     h                                  heartbeat
 --   relay -> client   the same frame with the sender's user id spliced in after
 --                     the letter, so a client cannot claim to be the other one.
--- Angles are radians x 10000, positions studs x 100.
+--                     `s` and `p` also carry a per-room sequence number and come
+--                     back to their SENDER - that stamped stream is the order both
+--                     machines claim slots in the shared pair by. `h` is answered
+--                     to the sender and never forwarded.
+-- Angles are radians x 10000, positions studs x 100, normals x 1000.
 
 local HttpService = game:GetService("HttpService")
 
@@ -1235,12 +1297,7 @@ local function dropPeer(userId)
 	peers[userId] = nil
 	-- now their end of the pair really does go: nothing here can re-sync a portal
 	-- whose owner is gone
-	for index = #pair.ids, 1, -1 do
-		local record = portals[pair.ids[index]]
-		if record and record.owner == userId then
-			closePortal(record.id)
-		end
-	end
+	forgetOwner(userId)
 end
 
 -- Peers are found by user id, not by name, and their character is re-resolved
@@ -1324,8 +1381,15 @@ onFrame = function(text)
 
 	local n = split(text, 2)
 	local userId = fields[1]
-	if not userId or userId == LP.UserId then
-		return -- the relay does not echo, but never trust that
+	if not userId then
+		return
+	end
+	-- Shots and re-announces are stamped by the relay and come back to their
+	-- sender too, because that stamped stream is the one both machines order the
+	-- shared pair by. Everything else is peer-only.
+	local mine = userId == LP.UserId
+	if mine and kind ~= 115 and kind ~= 112 then
+		return
 	end
 	local known = peers[userId]
 	if known then
@@ -1349,12 +1413,12 @@ onFrame = function(text)
 		peer.equipped = on
 		if holder then
 			holder.equipped = on
-			if on then
-				attach(holder)
-			else
+			if not on then
 				detach(holder)
 				holder.wantBlend = 0
 			end
+			-- attaching yields (CreateMeshPartAsync), and a frame handler that
+			-- yields lets the next frame in on top of it, so peerStep does it
 		end
 	elseif kind == 109 then -- 'm' ammo
 		local holder, peer = peerHolder(userId)
@@ -1366,30 +1430,53 @@ onFrame = function(text)
 			end
 		end
 
-	elseif kind == 115 then -- 's' shot: the shooter already decided the outcome,
-		if n < 9 then      -- so this replays it rather than raycasting again and
-			return         -- risking a different answer on each machine
+	elseif kind == 115 then -- 's' a shot, stamped by the relay and echoed to its
+		if n < 10 then     -- sender as well, because that stamped stream is the
+			return          -- order both machines claim pair slots in
 		end
-		local portalN = fields[2]
-		local muzzle = Vector3.new(fields[3] / 100, fields[4] / 100, fields[5] / 100)
-		local landing = Vector3.new(fields[6] / 100, fields[7] / 100, fields[8] / 100)
-		local hit = fields[9] == 1
-		local normal = hit and n >= 12 and Vector3.new(fields[10] / 1000, fields[11] / 1000, fields[12] / 1000)
+		local portalN = fields[3]
+		local hit = fields[10] == 1
+		local normal = hit
+				and n >= 13
+				and Vector3.new(fields[11] / 1000, fields[12] / 1000, fields[13] / 1000)
 			or Vector3.yAxis
-		shootFluid(muzzle, landing, function()
-			arrive(userId, portalN, hit, landing + normal * SURFACE_OFFSET, normal)
-		end)
-	elseif kind == 112 then -- 'p' a portal the peer already has open, re-announced
-		if n < 8 then       -- after a reconnect or a late join. No glob: it is
-			return           -- already there, this is only catching us up.
+		local landing = Vector3.new(fields[7] / 100, fields[8] / 100, fields[9] / 100)
+
+		-- the slot is claimed now, in relay order; the portal appears when the
+		-- fluid lands, which is a different moment on each machine
+		local record = hit and reserve(userId, portalN, landing + normal * SURFACE_OFFSET, normal) or nil
+
+		if mine then
+			-- our own glob is already in the air; only the reveal is still owed
+			local pending = pendingShots[portalN]
+			pendingShots[portalN] = nil
+			local left = pending and math.max(0, pending.flight - (os.clock() - pending.at)) or 0
+			if record then
+				task.delay(left, function()
+					revealPortal(record)
+				end)
+			end
+		else
+			local muzzle = Vector3.new(fields[4] / 100, fields[5] / 100, fields[6] / 100)
+			shootFluid(muzzle, landing, function()
+				revealPortal(record)
+			end)
 		end
-		arrive(
-			userId,
-			fields[2],
-			true,
-			Vector3.new(fields[3] / 100, fields[4] / 100, fields[5] / 100),
-			Vector3.new(fields[6] / 1000, fields[7] / 1000, fields[8] / 1000)
+	elseif kind == 112 then -- 'p' a portal that already exists, re-announced after
+		if n < 9 or mine then -- a reconnect or a late join. No glob and no opening
+			return             -- flourish: it has been standing there a while.
+		end
+		revealPortal(
+			reserve(
+				userId,
+				fields[3],
+				Vector3.new(fields[4] / 100, fields[5] / 100, fields[6] / 100),
+				Vector3.new(fields[7] / 1000, fields[8] / 1000, fields[9] / 1000)
+			),
+			true
 		)
+	elseif kind == 102 then -- 'f' drop every portal you hold from this owner: they
+		forgetOwner(userId) -- are about to re-announce the ones that really exist
 	elseif kind == 99 then -- 'c' close one
 		closePortal(userId .. ":" .. fields[2])
 	elseif kind == 120 then -- 'x' clear every portal, both ends of the bridge
@@ -1634,18 +1721,24 @@ local function fire()
 	local n = shotCounter
 	local landing = hit and hit.Position or muzzle + offset.Unit * RANGE
 	local normal = hit and hit.Normal or Vector3.yAxis
+	local flight = math.max((landing - muzzle).Magnitude / FLUID_SPEED, 0.05)
 
 	local frame = "s" .. n .. "," .. packV3(muzzle) .. "," .. packV3(landing) .. "," .. (hit and 1 or 0)
 	if hit then
 		frame = frame .. "," .. q(normal.X, 1000) .. "," .. q(normal.Y, 1000) .. "," .. q(normal.Z, 1000)
 	end
-	send(frame)
 
-	shootFluid(muzzle, landing, function()
-		-- the 0.1 stud offset is why a shot at the crosshair measures 0.10 studs
-		-- from the point under it: the plate floats deliberately that far off
-		arrive(LP.UserId, n, hit ~= nil, landing + normal * SURFACE_OFFSET, normal)
+	-- The glob flies immediately, so the trigger feels instant. The PORTAL waits
+	-- for the relay's stamped copy of this frame to come back, because that echo is
+	-- what puts both machines in the same order - and it returns in roughly a tenth
+	-- of the glob's flight, so nothing is visibly late. This is the fix for portals
+	-- eating each other at random.
+	pendingShots[n] = { at = os.clock(), flight = flight }
+	task.delay(flight + 10, function()
+		pendingShots[n] = nil -- the echo never came; do not hoard the entry
 	end)
+	send(frame)
+	shootFluid(muzzle, landing, nil)
 end
 
 --=========================================================================
