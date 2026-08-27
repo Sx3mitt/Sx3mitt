@@ -172,7 +172,7 @@ local ROLL_FROM = math.rad(30) -- yaw at which the arm starts rolling over
 
 local SHOT_COOLDOWN = 0.35
 local RANGE = 300
-local PORTAL_SIZE = 12 -- studs across
+local PORTAL_SIZE = 10 -- studs across
 local PORTAL_LIGHT_RANGE = 24 -- scaled with the portal, or a 12 stud one looks unlit
 local ENTER_DEPTH = 2.5 -- how far either side of the plane counts as being in it
 local SURFACE_OFFSET = 0.1
@@ -183,7 +183,7 @@ local PULSE, PULSE_RATE = 0.18, 2.5
 local OPEN_TIME, CLOSE_TIME = 0.25, 0.3
 local EXIT_OFFSET, EXIT_SPEED = 3.5, 22
 local TRAVEL_COOLDOWN = 1
-local START_AMMO = 10
+local START_AMMO = 1011
 local YELLOW = Color3.fromRGB(255, 209, 92)
 local BUTTON_YELLOW = Color3.fromRGB(255, 221, 51)
 local CLEAR_KEY = Enum.KeyCode.T
